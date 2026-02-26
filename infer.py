@@ -135,8 +135,8 @@ def main():
     parser.add_argument(
         "--images",
         type=str,
-        default="examples/kitchen",
-        help="Path to directory containing images or image files (space-separated)"
+        default="examples/room/images",
+        help="Path to directory containing images (e.g. examples/room/images or examples/kitchen/images)"
     )
     parser.add_argument(
         "--output",
@@ -159,10 +159,14 @@ def main():
     # Load images
     image_dir = Path(args.images)
     if image_dir.is_dir():
-        image_paths = sorted(list(image_dir.glob("*.png")) + list(image_dir.glob("*.jpg")))
+        image_paths = sorted(
+            list(image_dir.glob("*.png")) + list(image_dir.glob("*.jpg")) +
+            list(image_dir.glob("images/*.png")) + list(image_dir.glob("images/*.jpg"))
+        )
         if not image_paths:
-            print(f"❌ No images found in {image_dir}")
+            print(f"No images found in {image_dir}")
             return
+        print(f"Found {len(image_paths)} images in {image_dir}")
     else:
         image_paths = [Path(p) for p in args.images.split()]
     
