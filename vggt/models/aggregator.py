@@ -140,6 +140,9 @@ class Aggregator(nn.Module):
 
         self.use_reentrant = False # hardcoded to False
 
+        self._capture_global_attention_enabled = False
+        self._capture_global_attention_block_idx = None
+
     def __build_patch_embed__(
         self,
         patch_embed,
@@ -287,6 +290,54 @@ class Aggregator(nn.Module):
         print(f"    Total outputs: {len(output_list)}, patch_start_idx: {self.patch_start_idx}")
         print("="*80 + "\n")
         return output_list, self.patch_start_idx
+
+    def enable_global_attention_capture(
+        self,
+        block_idx: Optional[int] = None,
+        query_indices: Optional[Union[List[int], torch.Tensor]] = None,
+    ) -> None:
+        if block_idx is None:
+            block_idx = len(self.global_blocks) - 1
+
+        if block_idx < 0 or block_idx >= len(self.global_blocks):
+            raise ValueError(f"block_idx out of range: {block_idx}")
+
+        blk = self.global_blocks[block_idx]
+        if not hasattr(blk, "attn"):
+            raise RuntimeError("Target block has no attention module")
+
+        attn_mod = blk.attn
+        if not hasattr(attn_mod, "capture_attention"):
+            raise RuntimeError("Attention module does not support capture_attention")
+
+        attn_mod.fused_attn = False
+        attn_mod.capture_attention = True
+        attn_mod.attention_query_indices = query_indices
+        attn_mod.captured_attention = None
+
+        self._capture_global_attention_enabled = True
+        self._capture_global_attention_block_idx = block_idx
+
+    def disable_global_attention_capture(self) -> None:
+        if not self._capture_global_attention_enabled or self._capture_global_attention_block_idx is None:
+            return
+
+        blk = self.global_blocks[self._capture_global_attention_block_idx]
+        attn_mod = blk.attn
+        if hasattr(attn_mod, "capture_attention"):
+            attn_mod.capture_attention = False
+            attn_mod.attention_query_indices = None
+            attn_mod.captured_attention = None
+
+        self._capture_global_attention_enabled = False
+        self._capture_global_attention_block_idx = None
+
+    def get_captured_global_attention(self) -> Optional[torch.Tensor]:
+        if not self._capture_global_attention_enabled or self._capture_global_attention_block_idx is None:
+            return None
+        blk = self.global_blocks[self._capture_global_attention_block_idx]
+        attn_mod = blk.attn
+        return getattr(attn_mod, "captured_attention", None)
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """

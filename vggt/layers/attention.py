@@ -11,6 +11,7 @@ import logging
 import os
 import warnings
 
+import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -47,6 +48,10 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
+        self.capture_attention = False
+        self.attention_query_indices = None
+        self.captured_attention = None
+
     def forward(self, x: Tensor, pos=None) -> Tensor:
         B, N, C = x.shape
         
@@ -70,6 +75,13 @@ class Attention(nn.Module):
             attn = q @ k.transpose(-2, -1)
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
+            if self.capture_attention:
+                if self.attention_query_indices is None:
+                    self.captured_attention = attn.detach()
+                else:
+                    qi = self.attention_query_indices
+                    qi = torch.as_tensor(qi, device=attn.device, dtype=torch.long)
+                    self.captured_attention = attn.index_select(dim=-2, index=qi).detach()
             x = attn @ v
 
         # Reshape and project back

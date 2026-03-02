@@ -70,10 +70,6 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         aggregated_tokens_list, patch_start_idx = self.aggregator(images)
         print(f"[VGGT.forward] Aggregator output: {len(aggregated_tokens_list)} token lists, patch_start_idx={patch_start_idx}")
 
-        print("\n[VGGT.forward] Calling Aggregator...")
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
-        print(f"[VGGT.forward] Aggregator output: {len(aggregated_tokens_list)} token lists, patch_start_idx={patch_start_idx}")
-
         predictions = {}
 
         with torch.cuda.amp.autocast(enabled=False):
