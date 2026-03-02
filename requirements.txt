@@ -4,6 +4,8 @@ numpy==1.26.1
 Pillow
 matplotlib
 gradio
+trimesh
+pygltflib
 huggingface_hub
 einops
 safetensors

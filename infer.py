@@ -13,6 +13,7 @@ from pathlib import Path
 import gradio as gr
 from PIL import Image
 import matplotlib.cm as cm
+import trimesh
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -69,6 +70,68 @@ def run_inference(model, images, device, dtype):
             predictions = model(images)
     
     return predictions
+
+
+def _predictions_to_colored_pointcloud_glb(predictions, images_b, output_path, conf_thres=0.0, max_points=250000):
+    # predictions expected tensors on device
+    if "world_points" in predictions:
+        wp = predictions["world_points"]  # [B,S,H,W,3]
+        wp_conf = predictions.get("world_points_conf")
+    elif "depth" in predictions and "pose_enc" in predictions:
+        extr, intr = pose_encoding_to_extri_intri(predictions["pose_enc"], images_b.shape[-2:])
+        wp = unproject_depth_map_to_point_map(predictions["depth"], extr, intr)
+        wp_conf = predictions.get("depth_conf")
+    else:
+        raise ValueError("Predictions must contain world_points or (depth + pose_enc).")
+
+    # move to cpu numpy
+    if isinstance(wp, torch.Tensor):
+        wp = wp.detach().cpu().numpy()
+    if isinstance(wp_conf, torch.Tensor):
+        wp_conf = wp_conf.detach().cpu().numpy()
+
+    if isinstance(images_b, torch.Tensor):
+        imgs = images_b.detach().cpu().numpy()
+    else:
+        imgs = images_b
+
+    # squeeze batch
+    wp = wp[0]
+    imgs = imgs[0]  # [S,3,H,W]
+
+    S, _, H, W = imgs.shape
+    imgs_hw3 = np.transpose(imgs, (0, 2, 3, 1))
+    imgs_hw3 = np.clip(imgs_hw3, 0.0, 1.0)
+
+    # build masks
+    valid = np.isfinite(wp).all(axis=-1)
+    if wp_conf is not None:
+        # wp_conf can be [B,S,H,W] or [B,S,H,W,1]
+        wp_conf = wp_conf[0]
+        if wp_conf.ndim == 4:
+            wp_conf = wp_conf[..., 0]
+        valid = valid & (wp_conf >= conf_thres)
+
+    # flatten
+    pts = wp.reshape(-1, 3)
+    cols = imgs_hw3.reshape(-1, 3)
+    valid_f = valid.reshape(-1)
+
+    pts = pts[valid_f]
+    cols = cols[valid_f]
+
+    # subsample
+    if pts.shape[0] > max_points:
+        idx = np.random.choice(pts.shape[0], size=max_points, replace=False)
+        pts = pts[idx]
+        cols = cols[idx]
+
+    cols_u8 = (cols * 255.0).astype(np.uint8)
+
+    pc = trimesh.points.PointCloud(vertices=pts.astype(np.float32), colors=cols_u8)
+    scene = trimesh.Scene(pc)
+    scene.export(output_path)
+    return output_path
 
 
 def _compute_patch_grid(H, W, patch_size):
@@ -249,20 +312,61 @@ def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=Fals
         )
         return gallery, status
 
+    def _run_reconstruction(conf_thres, max_points):
+        out_dir = output_dir / "reconstruction"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        glb_path = out_dir / "reconstruction.glb"
+
+        if len(images.shape) == 4:
+            images_for_model = images.unsqueeze(0)
+        else:
+            images_for_model = images
+
+        images_for_model = images_for_model.to(device)
+
+        with torch.no_grad():
+            if dtype != torch.float32:
+                with torch.cuda.amp.autocast(dtype=dtype):
+                    preds = model(images_for_model)
+            else:
+                preds = model(images_for_model)
+
+        glb = _predictions_to_colored_pointcloud_glb(
+            preds,
+            images_for_model,
+            str(glb_path),
+            conf_thres=float(conf_thres),
+            max_points=int(max_points),
+        )
+        return glb, "Reconstruction exported"
+
     with gr.Blocks() as demo:
-        gr.Markdown("## VGGT Global Attention (last global block)\nClick frame 0 to choose a query patch. Change head to update without recomputing forward.")
-        cache = gr.State(None)
+        with gr.Tabs():
+            with gr.TabItem("Attention"):
+                gr.Markdown("## VGGT Global Attention (last global block)\nClick frame 0 to choose a query patch. Change head to update without recomputing forward.")
+                cache = gr.State(None)
 
-        with gr.Row():
-            img = gr.Image(value=frame0, label="Frame 0", interactive=True)
-            with gr.Column():
-                head_sel = gr.Dropdown(choices=head_choices, value="avg", label="Head")
-                status = gr.Textbox(value="click a patch", label="Status")
+                with gr.Row():
+                    img = gr.Image(value=frame0, label="Frame 0", interactive=True)
+                    with gr.Column():
+                        head_sel = gr.Dropdown(choices=head_choices, value="avg", label="Head")
+                        status = gr.Textbox(value="click a patch", label="Status")
 
-        gallery = gr.Gallery(label="Attention heatmaps (per frame)", columns=4, rows=2, height=420)
+                gallery = gr.Gallery(label="Attention overlays (per frame)", columns=4, rows=2, height=420)
+                img.select(on_select, inputs=[head_sel, cache], outputs=[gallery, status, cache])
+                head_sel.change(on_head_change, inputs=[head_sel, cache], outputs=[gallery, status])
 
-        img.select(on_select, inputs=[head_sel, cache], outputs=[gallery, status, cache])
-        head_sel.change(on_head_change, inputs=[head_sel, cache], outputs=[gallery, status])
+            with gr.TabItem("Reconstruction"):
+                gr.Markdown("## 3D reconstruction (colored point cloud)\nThis exports a `.glb` file and shows it in an interactive 3D viewer.")
+                with gr.Row():
+                    with gr.Column():
+                        conf_thres = gr.Slider(minimum=0.0, maximum=10.0, value=0.0, step=0.1, label="Confidence threshold")
+                        max_points = gr.Slider(minimum=10000, maximum=500000, value=250000, step=10000, label="Max points")
+                        recon_btn = gr.Button("Reconstruct", variant="primary")
+                        recon_status = gr.Textbox(value="", label="Status")
+                    recon_view = gr.Model3D(height=520, zoom_speed=0.5, pan_speed=0.5)
+
+                recon_btn.click(_run_reconstruction, inputs=[conf_thres, max_points], outputs=[recon_view, recon_status])
 
     server_name = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
     server_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
