@@ -193,6 +193,34 @@ def _compute_and_capture_attention(model, images_b, device, dtype, q_patch):
     return attn, grid_h, grid_w, patch_start_idx, P
 
 
+def _compute_and_capture_attention_for_block(model, images_b, device, dtype, q_patch, block_idx: int):
+    B, S, _, H, W = images_b.shape
+    patch_size = model.aggregator.patch_size
+    grid_h, grid_w = _compute_patch_grid(H, W, patch_size)
+    P = grid_h * grid_w
+    patch_start_idx = model.aggregator.patch_start_idx
+
+    P_total = patch_start_idx + P
+    q_global = 0 * P_total + (patch_start_idx + q_patch)
+
+    model.aggregator.enable_global_attention_capture(block_idx=int(block_idx), query_indices=[q_global])
+
+    with torch.no_grad():
+        if dtype != torch.float32:
+            with torch.cuda.amp.autocast(dtype=dtype):
+                _ = model(images_b.to(device))
+        else:
+            _ = model(images_b.to(device))
+
+    attn = model.aggregator.get_captured_global_attention()
+    model.aggregator.disable_global_attention_capture()
+
+    if attn is None:
+        raise RuntimeError("Attention capture returned None.")
+
+    return attn, grid_h, grid_w, patch_start_idx, P
+
+
 def _attention_heatmaps_from_capture(attn, S, grid_h, grid_w, patch_start_idx, P, head_selection):
     # attn: [B, heads, 1, Nk]
     attn = attn[0]
@@ -253,16 +281,19 @@ def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=Fals
     B, S, _, H, W = images_b.shape
     frame0 = images_b[0, 0].detach().cpu().permute(1, 2, 0).numpy()
     num_heads = model.aggregator.global_blocks[-1].attn.num_heads
+    num_global_blocks = len(model.aggregator.global_blocks)
 
     if validate:
         _validate_fused_vs_unfused(model, images, device, dtype)
 
     head_choices = ["avg"] + [str(i) for i in range(num_heads)]
 
-    def _render_gallery(attn, grid_h, grid_w, patch_start_idx, P, head_sel, q_patch):
+    def _render_gallery(attn, grid_h, grid_w, patch_start_idx, P, head_sel, q_patch, include_frame0: bool):
         heatmaps = _attention_heatmaps_from_capture(attn, S, grid_h, grid_w, patch_start_idx, P, head_sel)
         imgs = []
         for t, hm in enumerate(heatmaps):
+            if (not include_frame0) and t == 0:
+                continue
             hm_up = _upsample_heatmap_to_image(hm, model.aggregator.patch_size)
             hm_rgb = _heatmap_to_rgb_uint8(hm_up)
 
@@ -275,7 +306,7 @@ def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=Fals
             imgs.append((overlay, f"frame {t} overlay"))
         return imgs, f"query_patch={q_patch}, head={head_sel}"
 
-    def on_select(evt: gr.SelectData, head_sel, cache):
+    def on_select(evt: gr.SelectData, head_sel, block_sel, include_frame0, cache):
         x, y = evt.index
         patch_size = model.aggregator.patch_size
         grid_h, grid_w = _compute_patch_grid(H, W, patch_size)
@@ -284,8 +315,10 @@ def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=Fals
         if q_patch < 0 or q_patch >= grid_h * grid_w:
             return gr.update(), "click inside image", cache
 
-        # compute once per patch
-        attn, gh, gw, psi, P = _compute_and_capture_attention(model, images_b, device, dtype, q_patch)
+        # compute once per (patch, block)
+        attn, gh, gw, psi, P = _compute_and_capture_attention_for_block(
+            model, images_b, device, dtype, q_patch, block_idx=int(block_sel)
+        )
         cache = {
             "q_patch": q_patch,
             "attn": attn.cpu(),
@@ -293,11 +326,12 @@ def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=Fals
             "grid_w": gw,
             "patch_start_idx": psi,
             "P": P,
+            "block_idx": int(block_sel),
         }
-        gallery, status = _render_gallery(attn.cpu(), gh, gw, psi, P, head_sel, q_patch)
+        gallery, status = _render_gallery(attn.cpu(), gh, gw, psi, P, head_sel, q_patch, bool(include_frame0))
         return gallery, status, cache
 
-    def on_head_change(head_sel, cache):
+    def on_head_change(head_sel, include_frame0, cache):
         if cache is None or "attn" not in cache:
             return gr.update(), "click a patch first"
         attn = cache["attn"]
@@ -309,8 +343,15 @@ def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=Fals
             cache["P"],
             head_sel,
             cache["q_patch"],
+            bool(include_frame0),
         )
         return gallery, status
+
+    def on_block_change(block_sel, head_sel, include_frame0, cache):
+        if cache is None or "q_patch" not in cache:
+            return gr.update(), "click a patch first", None
+        # invalidate cache so we don't reuse attention from a different block
+        return gr.update(), f"block changed to {int(block_sel)}; click the same patch again", None
 
     def _run_reconstruction(conf_thres, max_points):
         out_dir = output_dir / "reconstruction"
@@ -343,18 +384,26 @@ def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=Fals
     with gr.Blocks() as demo:
         with gr.Tabs():
             with gr.TabItem("Attention"):
-                gr.Markdown("## VGGT Global Attention (last global block)\nClick frame 0 to choose a query patch. Change head to update without recomputing forward.")
+                gr.Markdown("## VGGT Global Attention\nClick frame 0 to choose a query patch. This visualizes how that query patch distributes attention over patches in each frame (including frame 0 unless disabled).")
                 cache = gr.State(None)
 
                 with gr.Row():
                     img = gr.Image(value=frame0, label="Frame 0", interactive=True)
                     with gr.Column():
+                        block_sel = gr.Dropdown(
+                            choices=[str(i) for i in range(num_global_blocks)],
+                            value=str(num_global_blocks - 1),
+                            label="Global attention block",
+                        )
                         head_sel = gr.Dropdown(choices=head_choices, value="avg", label="Head")
+                        include_frame0 = gr.Checkbox(value=True, label="Include frame 0 overlay")
                         status = gr.Textbox(value="click a patch", label="Status")
 
                 gallery = gr.Gallery(label="Attention overlays (per frame)", columns=4, rows=2, height=420)
-                img.select(on_select, inputs=[head_sel, cache], outputs=[gallery, status, cache])
-                head_sel.change(on_head_change, inputs=[head_sel, cache], outputs=[gallery, status])
+                img.select(on_select, inputs=[head_sel, block_sel, include_frame0, cache], outputs=[gallery, status, cache])
+                head_sel.change(on_head_change, inputs=[head_sel, include_frame0, cache], outputs=[gallery, status])
+                include_frame0.change(on_head_change, inputs=[head_sel, include_frame0, cache], outputs=[gallery, status])
+                block_sel.change(on_block_change, inputs=[block_sel, head_sel, include_frame0, cache], outputs=[gallery, status, cache])
 
             with gr.TabItem("Reconstruction"):
                 gr.Markdown("## 3D reconstruction (colored point cloud)\nThis exports a `.glb` file and shows it in an interactive 3D viewer.")

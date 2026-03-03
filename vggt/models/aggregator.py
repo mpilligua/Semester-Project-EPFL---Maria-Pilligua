@@ -310,7 +310,6 @@ class Aggregator(nn.Module):
         if not hasattr(attn_mod, "capture_attention"):
             raise RuntimeError("Attention module does not support capture_attention")
 
-        attn_mod.fused_attn = False
         attn_mod.capture_attention = True
         attn_mod.attention_query_indices = query_indices
         attn_mod.captured_attention = None

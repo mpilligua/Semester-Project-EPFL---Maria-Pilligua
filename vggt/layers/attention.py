@@ -84,6 +84,13 @@ class Attention(nn.Module):
                     self.captured_attention = attn.index_select(dim=-2, index=qi).detach()
             x = attn @ v
 
+        if self.capture_attention and self.attention_query_indices is not None:
+            qi = torch.as_tensor(self.attention_query_indices, device=q.device, dtype=torch.long)
+            q_sel = q.index_select(dim=-2, index=qi)
+            attn_sel = (q_sel * self.scale) @ k.transpose(-2, -1)
+            attn_sel = attn_sel.softmax(dim=-1)
+            self.captured_attention = attn_sel.detach()
+
         # Reshape and project back
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
