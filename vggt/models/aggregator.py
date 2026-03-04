@@ -317,16 +317,43 @@ class Aggregator(nn.Module):
         self._capture_global_attention_enabled = True
         self._capture_global_attention_block_idx = block_idx
 
+    def enable_global_attention_capture_all(
+        self,
+        query_indices: Optional[Union[List[int], torch.Tensor]] = None,
+    ) -> None:
+        for blk in self.global_blocks:
+            if not hasattr(blk, "attn"):
+                raise RuntimeError("Target block has no attention module")
+            attn_mod = blk.attn
+            if not hasattr(attn_mod, "capture_attention"):
+                raise RuntimeError("Attention module does not support capture_attention")
+            attn_mod.capture_attention = True
+            attn_mod.attention_query_indices = query_indices
+            attn_mod.captured_attention = None
+
+        self._capture_global_attention_enabled = True
+        self._capture_global_attention_block_idx = None
+        self._capture_global_attention_all_enabled = True
+
     def disable_global_attention_capture(self) -> None:
-        if not self._capture_global_attention_enabled or self._capture_global_attention_block_idx is None:
+        if not self._capture_global_attention_enabled:
             return
 
-        blk = self.global_blocks[self._capture_global_attention_block_idx]
-        attn_mod = blk.attn
-        if hasattr(attn_mod, "capture_attention"):
-            attn_mod.capture_attention = False
-            attn_mod.attention_query_indices = None
-            attn_mod.captured_attention = None
+        if getattr(self, "_capture_global_attention_all_enabled", False):
+            for blk in self.global_blocks:
+                attn_mod = blk.attn
+                if hasattr(attn_mod, "capture_attention"):
+                    attn_mod.capture_attention = False
+                    attn_mod.attention_query_indices = None
+                    attn_mod.captured_attention = None
+            self._capture_global_attention_all_enabled = False
+        elif self._capture_global_attention_block_idx is not None:
+            blk = self.global_blocks[self._capture_global_attention_block_idx]
+            attn_mod = blk.attn
+            if hasattr(attn_mod, "capture_attention"):
+                attn_mod.capture_attention = False
+                attn_mod.attention_query_indices = None
+                attn_mod.captured_attention = None
 
         self._capture_global_attention_enabled = False
         self._capture_global_attention_block_idx = None
@@ -337,6 +364,14 @@ class Aggregator(nn.Module):
         blk = self.global_blocks[self._capture_global_attention_block_idx]
         attn_mod = blk.attn
         return getattr(attn_mod, "captured_attention", None)
+
+    def get_captured_global_attention_all(self) -> Optional[List[Optional[torch.Tensor]]]:
+        if not self._capture_global_attention_enabled or not getattr(self, "_capture_global_attention_all_enabled", False):
+            return None
+        out: List[Optional[torch.Tensor]] = []
+        for blk in self.global_blocks:
+            out.append(getattr(blk.attn, "captured_attention", None))
+        return out
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """

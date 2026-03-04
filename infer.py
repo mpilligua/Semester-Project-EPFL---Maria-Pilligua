@@ -11,7 +11,10 @@ import torch
 import numpy as np
 from pathlib import Path
 import gradio as gr
-from PIL import Image
+import base64
+import io
+import time
+from PIL import Image, ImageDraw
 import matplotlib.cm as cm
 import trimesh
 
@@ -120,6 +123,11 @@ def _predictions_to_colored_pointcloud_glb(predictions, images_b, output_path, c
     pts = pts[valid_f]
     cols = cols[valid_f]
 
+    # Convert to a more standard 3D viewer convention (Y-up).
+    # VGGT world coordinates are often in an image-like convention where Y increases down.
+    # Flipping Y makes the reconstruction appear upright in glTF viewers.
+    pts[:, 1] *= -1.0
+
     # subsample
     if pts.shape[0] > max_points:
         idx = np.random.choice(pts.shape[0], size=max_points, replace=False)
@@ -132,6 +140,18 @@ def _predictions_to_colored_pointcloud_glb(predictions, images_b, output_path, c
     scene = trimesh.Scene(pc)
     scene.export(output_path)
     return output_path
+
+
+def _predictions_to_lightweight_cpu(predictions):
+    out = {}
+    for k in ("world_points", "world_points_conf", "depth", "depth_conf", "pose_enc"):
+        if k in predictions:
+            v = predictions[k]
+            if isinstance(v, torch.Tensor):
+                out[k] = v.detach().cpu()
+            else:
+                out[k] = v
+    return out
 
 
 def _compute_patch_grid(H, W, patch_size):
@@ -180,9 +200,9 @@ def _compute_and_capture_attention(model, images_b, device, dtype, q_patch):
     with torch.no_grad():
         if dtype != torch.float32:
             with torch.cuda.amp.autocast(dtype=dtype):
-                _ = model(images_b.to(device))
+                preds = model(images_b.to(device))
         else:
-            _ = model(images_b.to(device))
+            preds = model(images_b.to(device))
 
     attn = model.aggregator.get_captured_global_attention()
     model.aggregator.disable_global_attention_capture()
@@ -191,6 +211,34 @@ def _compute_and_capture_attention(model, images_b, device, dtype, q_patch):
         raise RuntimeError("Attention capture returned None.")
 
     return attn, grid_h, grid_w, patch_start_idx, P
+
+
+def _compute_and_capture_attention_all_global_blocks(model, images_b, device, dtype, q_patch, q_frame=0):
+    B, S, _, H, W = images_b.shape
+    patch_size = model.aggregator.patch_size
+    grid_h, grid_w = _compute_patch_grid(H, W, patch_size)
+    P = grid_h * grid_w
+    patch_start_idx = model.aggregator.patch_start_idx
+
+    P_total = patch_start_idx + P
+    q_global = int(q_frame) * P_total + (patch_start_idx + q_patch)
+
+    model.aggregator.enable_global_attention_capture_all(query_indices=[q_global])
+
+    with torch.no_grad():
+        if dtype != torch.float32:
+            with torch.cuda.amp.autocast(dtype=dtype):
+                preds = model(images_b.to(device))
+        else:
+            preds = model(images_b.to(device))
+
+    attn_all = model.aggregator.get_captured_global_attention_all()
+    model.aggregator.disable_global_attention_capture()
+
+    if attn_all is None or any(a is None for a in attn_all):
+        raise RuntimeError("Attention capture returned None for one or more blocks.")
+
+    return preds, attn_all, grid_h, grid_w, patch_start_idx, P
 
 
 def _compute_and_capture_attention_for_block(model, images_b, device, dtype, q_patch, block_idx: int):
@@ -269,108 +317,327 @@ def _overlay_heatmap_on_image(image_rgb_uint8, heat_rgb_uint8, alpha=0.45):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def _rgb_uint8_to_data_uri(rgb_uint8):
+    im = Image.fromarray(rgb_uint8)
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def _render_patch_grid_preview(frame0_rgb_uint8, patch_size, q_patch, grid_w, grid_h):
+    im = Image.fromarray(frame0_rgb_uint8.copy()).convert("RGBA")
+    draw = ImageDraw.Draw(im, "RGBA")
+    H, W = frame0_rgb_uint8.shape[0], frame0_rgb_uint8.shape[1]
+
+    line = (255, 255, 255, 70)
+    for x in range(0, W + 1, patch_size):
+        draw.line([(x, 0), (x, H)], fill=line, width=1)
+    for y in range(0, H + 1, patch_size):
+        draw.line([(0, y), (W, y)], fill=line, width=1)
+
+    if q_patch is not None:
+        row = int(q_patch) // int(grid_w)
+        col = int(q_patch) % int(grid_w)
+        x0 = col * patch_size
+        y0 = row * patch_size
+        x1 = min(W - 1, x0 + patch_size)
+        y1 = min(H - 1, y0 + patch_size)
+        draw.rectangle([x0, y0, x1, y1], outline=(255, 0, 0, 255), width=3)
+
+    return np.array(im.convert("RGB"))
+
+
+def _attention_thumbnail_rgb(attn_block, S, frame_idx, grid_h, grid_w, patch_start_idx, P, head_idx, out_size=64):
+    attn_block = attn_block[0]
+    vec = attn_block[int(head_idx), 0]
+    P_total = patch_start_idx + P
+    start = int(frame_idx) * P_total + patch_start_idx
+    end = start + P
+    a = vec[start:end].detach().cpu().float().view(grid_h, grid_w).numpy()
+    a = a - a.min()
+    if a.max() > 0:
+        a = a / a.max()
+    rgb = _heatmap_to_rgb_uint8(a)
+    im = Image.fromarray(rgb)
+    im = im.resize((out_size, out_size), resample=Image.NEAREST)
+    return np.array(im)
+
+
+def _attention_thumbnail_overlay_rgb(attn_block, S, frame_idx, frame_rgb_uint8, grid_h, grid_w, patch_start_idx, P, head_idx, out_size=64, alpha=0.45):
+    heat_rgb = _attention_thumbnail_rgb(attn_block, S, frame_idx, grid_h, grid_w, patch_start_idx, P, head_idx, out_size=out_size)
+    frame_im = Image.fromarray(frame_rgb_uint8)
+    frame_im = frame_im.resize((out_size, out_size), resample=Image.BILINEAR)
+    frame_small = np.array(frame_im)
+    return _overlay_heatmap_on_image(frame_small, heat_rgb, alpha=alpha)
+
+
+def _render_attention_grid_html(attn_all, frames_uint8, S, mode, sel, frame_idx, grid_h, grid_w, patch_start_idx, P, num_heads, num_layers, cell=96, gap=2):
+    cell = int(cell)
+    gap = int(gap)
+    header_h = 22
+    left_w = 46
+
+    style = f"""
+    <style>
+      .attn-wrap {{ overflow: auto; width: 100%; height: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px; }}
+      .attn-grid {{ display: grid; gap: {gap}px; align-items: center; }}
+      .attn-top {{ position: sticky; top: 0; background: white; z-index: 3; height: {header_h}px; display:flex; align-items:center; justify-content:center; font-size: 11px; color: #374151; }}
+      .attn-left {{ position: sticky; left: 0; background: white; z-index: 2; display:flex; align-items:center; justify-content:center; font-size: 11px; color: #374151; }}
+      .attn-corner {{ position: sticky; top: 0; left: 0; z-index: 4; background: white; height: {header_h}px; }}
+      .attn-img {{ width: {cell}px; height: {cell}px; border-radius: 6px; border: 1px solid #f3f4f6; cursor: zoom-in; }}
+      .attn-cell {{ display:flex; align-items:center; justify-content:center; }}
+    </style>
+    """
+
+    if mode == "default":
+        # Rendering all heads × layers as base64 images can be extremely heavy in the browser.
+        # Cap heads in the default overview; use "head" / "layer" modes for full detail.
+        num_heads_show = min(int(num_heads), 8)
+        ncols = num_layers
+        parts = [style, '<div class="attn-wrap">', f'<div class="attn-grid" style="grid-template-columns: {left_w}px repeat({ncols}, {cell}px);">']
+        parts.append('<div class="attn-corner"></div>')
+        for l in range(num_layers):
+            parts.append(f'<div class="attn-top">L{l}</div>')
+
+        frame_rgb_uint8 = frames_uint8[int(frame_idx)]
+        for h in range(num_heads_show):
+            parts.append(f'<div class="attn-left">H{h}</div>')
+            for l in range(num_layers):
+                rgb = _attention_thumbnail_overlay_rgb(
+                    attn_all[l], S, frame_idx, frame_rgb_uint8, grid_h, grid_w, patch_start_idx, P, h, out_size=cell
+                )
+                uri = _rgb_uint8_to_data_uri(rgb)
+                parts.append(f'<div class="attn-cell"><a href="{uri}" target="_self"><img class="attn-img" src="{uri}" loading="lazy" decoding="async"/></a></div>')
+        parts.append('</div></div>')
+        return "".join(parts)
+
+    if mode == "head":
+        head_idx = int(sel)
+        ncols = num_layers
+        parts = [style, '<div class="attn-wrap">', f'<div class="attn-grid" style="grid-template-columns: {left_w}px repeat({ncols}, {cell}px);">']
+        parts.append('<div class="attn-corner"></div>')
+        for l in range(num_layers):
+            parts.append(f'<div class="attn-top">L{l}</div>')
+        for f in range(S):
+            parts.append(f'<div class="attn-left">F{f}</div>')
+            frame_rgb_uint8 = frames_uint8[int(f)]
+            for l in range(num_layers):
+                rgb = _attention_thumbnail_overlay_rgb(
+                    attn_all[l], S, f, frame_rgb_uint8, grid_h, grid_w, patch_start_idx, P, head_idx, out_size=cell
+                )
+                uri = _rgb_uint8_to_data_uri(rgb)
+                parts.append(f'<div class="attn-cell"><a href="{uri}" target="_self"><img class="attn-img" src="{uri}" loading="lazy" decoding="async"/></a></div>')
+        parts.append('</div></div>')
+        return "".join(parts)
+
+    if mode == "layer":
+        layer_idx = int(sel)
+        ncols = S
+        parts = [style, '<div class="attn-wrap">', f'<div class="attn-grid" style="grid-template-columns: {left_w}px repeat({ncols}, {cell}px);">']
+        parts.append('<div class="attn-corner"></div>')
+        for f in range(S):
+            parts.append(f'<div class="attn-top">F{f}</div>')
+        for h in range(num_heads):
+            parts.append(f'<div class="attn-left">H{h}</div>')
+            for f in range(S):
+                frame_rgb_uint8 = frames_uint8[int(f)]
+                rgb = _attention_thumbnail_overlay_rgb(
+                    attn_all[layer_idx], S, f, frame_rgb_uint8, grid_h, grid_w, patch_start_idx, P, h, out_size=cell
+                )
+                uri = _rgb_uint8_to_data_uri(rgb)
+                parts.append(f'<div class="attn-cell"><a href="{uri}" target="_self"><img class="attn-img" src="{uri}" loading="lazy" decoding="async"/></a></div>')
+        parts.append('</div></div>')
+        return "".join(parts)
+
+    return style
+
+
 def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=False):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if len(images.shape) == 4:
-        images_b = images.unsqueeze(0)
-    else:
-        images_b = images
+    def _as_batched(images_any):
+        if len(images_any.shape) == 4:
+            return images_any.unsqueeze(0)
+        return images_any
 
-    B, S, _, H, W = images_b.shape
-    frame0 = images_b[0, 0].detach().cpu().permute(1, 2, 0).numpy()
+    images_b0 = _as_batched(images)
+    B, S0, _, H0, W0 = images_b0.shape
+    frames0_uint8 = (images_b0[0].detach().cpu().permute(0, 2, 3, 1).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+
+    # Backend-only holder (do NOT put tensors into gr.State / component values).
+    scene_holder = {
+        "images_b": images_b0,
+        "frames_uint8": frames0_uint8,
+        "S": int(S0),
+        "H": int(H0),
+        "W": int(W0),
+    }
+
+    attn_holder = {
+        "attn_all": None,
+        "preds": None,
+        "grid_h": None,
+        "grid_w": None,
+        "patch_start_idx": None,
+        "P": None,
+        "S": int(S0),
+        "html_cache": {},
+    }
     num_heads = model.aggregator.global_blocks[-1].attn.num_heads
-    num_global_blocks = len(model.aggregator.global_blocks)
+    num_layers = len(model.aggregator.global_blocks)
 
     if validate:
         _validate_fused_vs_unfused(model, images, device, dtype)
 
-    head_choices = ["avg"] + [str(i) for i in range(num_heads)]
+    def _render_label(mode, sel, frame_idx):
+        if mode == "head":
+            return f"<div class='frame-label'>Head {int(sel)}</div>"
+        if mode == "layer":
+            return f"<div class='frame-label'>Layer {int(sel)}</div>"
+        return f"<div class='frame-label'>frame {int(frame_idx)}</div>"
 
-    def _render_gallery(attn, grid_h, grid_w, patch_start_idx, P, head_sel, q_patch, include_frame0: bool):
-        heatmaps = _attention_heatmaps_from_capture(attn, S, grid_h, grid_w, patch_start_idx, P, head_sel)
-        imgs = []
-        for t, hm in enumerate(heatmaps):
-            if (not include_frame0) and t == 0:
-                continue
-            hm_up = _upsample_heatmap_to_image(hm, model.aggregator.patch_size)
-            hm_rgb = _heatmap_to_rgb_uint8(hm_up)
-
-            frame_t = images_b[0, t].detach().cpu().permute(1, 2, 0).numpy()
-            frame_t_uint8 = (np.clip(frame_t, 0.0, 1.0) * 255.0).astype(np.uint8)
-            overlay = _overlay_heatmap_on_image(frame_t_uint8, hm_rgb, alpha=0.45)
-
-            out = output_dir / f"attn_overlay_f0_p{q_patch}_to_f{t}_head{head_sel}.png"
-            Image.fromarray(overlay).save(out)
-            imgs.append((overlay, f"frame {t} overlay"))
-        return imgs, f"query_patch={q_patch}, head={head_sel}"
-
-    def on_select(evt: gr.SelectData, head_sel, block_sel, include_frame0, cache):
+    def on_select(evt: gr.SelectData, frame_idx, query_frame, view_mode, view_sel, thumb_size, cache):
         x, y = evt.index
         patch_size = model.aggregator.patch_size
+        images_b = scene_holder.get("images_b")
+        if images_b is None:
+            return gr.update(), gr.update(), gr.update(), cache
+        B, S, _, H, W = images_b.shape
         grid_h, grid_w = _compute_patch_grid(H, W, patch_size)
         q_patch = _xy_to_patch_index(x, y, patch_size, grid_w)
 
         if q_patch < 0 or q_patch >= grid_h * grid_w:
-            return gr.update(), "click inside image", cache
+            label = _render_label(str(view_mode), int(view_sel), int(frame_idx))
+            return gr.update(), label, gr.update(), cache
 
-        # compute once per (patch, block)
-        attn, gh, gw, psi, P = _compute_and_capture_attention_for_block(
-            model, images_b, device, dtype, q_patch, block_idx=int(block_sel)
+        preds, attn_all, gh, gw, psi, P = _compute_and_capture_attention_all_global_blocks(
+            model, images_b, device, dtype, q_patch, q_frame=int(query_frame)
         )
+        # Store heavy outputs in backend-only holder to avoid Gradio serialization hangs.
+        attn_holder["attn_all"] = [a.detach().cpu() for a in attn_all]
+        attn_holder["preds"] = _predictions_to_lightweight_cpu(preds)
+        attn_holder["grid_h"] = int(gh)
+        attn_holder["grid_w"] = int(gw)
+        attn_holder["patch_start_idx"] = int(psi)
+        attn_holder["P"] = int(P)
+        attn_holder["S"] = int(S)
+        attn_holder["html_cache"] = {}
+
         cache = {
-            "q_patch": q_patch,
-            "attn": attn.cpu(),
-            "grid_h": gh,
-            "grid_w": gw,
-            "patch_start_idx": psi,
-            "P": P,
-            "block_idx": int(block_sel),
+            "q_patch": int(q_patch),
+            "q_frame": int(query_frame),
+            "thumb_size": int(thumb_size),
         }
-        gallery, status = _render_gallery(attn.cpu(), gh, gw, psi, P, head_sel, q_patch, bool(include_frame0))
-        return gallery, status, cache
 
-    def on_head_change(head_sel, include_frame0, cache):
-        if cache is None or "attn" not in cache:
-            return gr.update(), "click a patch first"
-        attn = cache["attn"]
-        gallery, status = _render_gallery(
-            attn,
-            cache["grid_h"],
-            cache["grid_w"],
-            cache["patch_start_idx"],
-            cache["P"],
-            head_sel,
-            cache["q_patch"],
-            bool(include_frame0),
+        t0 = time.time()
+        key = (str(view_mode), int(view_sel), int(frame_idx), int(cache.get("thumb_size", 96)))
+        html = _render_attention_grid_html(
+            attn_holder["attn_all"],
+            scene_holder["frames_uint8"],
+            attn_holder["S"],
+            str(view_mode),
+            int(view_sel),
+            int(frame_idx),
+            attn_holder["grid_h"],
+            attn_holder["grid_w"],
+            attn_holder["patch_start_idx"],
+            attn_holder["P"],
+            num_heads,
+            num_layers,
+            cell=int(cache.get("thumb_size", 96)),
+            gap=2,
         )
-        return gallery, status
+        attn_holder["html_cache"][key] = html
+        print(f"[attn-ui] render grid html: {time.time() - t0:.3f}s")
 
-    def on_block_change(block_sel, head_sel, include_frame0, cache):
-        if cache is None or "q_patch" not in cache:
-            return gr.update(), "click a patch first", None
-        # invalidate cache so we don't reuse attention from a different block
-        return gr.update(), f"block changed to {int(block_sel)}; click the same patch again", None
+        frame_q_uint8 = scene_holder["frames_uint8"][int(query_frame)]
+        patch_preview = _render_patch_grid_preview(frame_q_uint8, patch_size, q_patch, grid_w, grid_h)
+        label = _render_label(str(view_mode), int(view_sel), int(frame_idx))
+        return patch_preview, label, html, cache
 
-    def _run_reconstruction(conf_thres, max_points):
+    def on_view_change(view_mode, view_sel, frame_idx, cache):
+        if cache is None or attn_holder.get("attn_all") is None:
+            return _render_label(str(view_mode), int(view_sel), int(frame_idx)), gr.update()
+        thumb_size = int(cache.get("thumb_size", 96)) if isinstance(cache, dict) else 96
+        key = (str(view_mode), int(view_sel), int(frame_idx), thumb_size)
+        html_cache = attn_holder.get("html_cache")
+        if isinstance(html_cache, dict) and key in html_cache:
+            return _render_label(str(view_mode), int(view_sel), int(frame_idx)), html_cache[key]
+        t0 = time.time()
+        html = _render_attention_grid_html(
+            attn_holder["attn_all"],
+            scene_holder["frames_uint8"],
+            attn_holder["S"],
+            str(view_mode),
+            int(view_sel),
+            int(frame_idx),
+            attn_holder["grid_h"],
+            attn_holder["grid_w"],
+            attn_holder["patch_start_idx"],
+            attn_holder["P"],
+            num_heads,
+            num_layers,
+            cell=thumb_size,
+            gap=2,
+        )
+        if isinstance(attn_holder.get("html_cache"), dict):
+            attn_holder["html_cache"][key] = html
+        print(f"[attn-ui] render grid html (view change): {time.time() - t0:.3f}s")
+        return _render_label(str(view_mode), int(view_sel), int(frame_idx)), html
+
+    def on_prev(view_mode, view_sel, frame_idx, cache):
+        view_mode = str(view_mode)
+        if view_mode == "head":
+            new_sel = max(0, int(view_sel) - 1)
+            label, html = on_view_change(view_mode, new_sel, int(frame_idx), cache)
+            return view_mode, new_sel, int(frame_idx), label, html
+        if view_mode == "layer":
+            new_sel = max(0, int(view_sel) - 1)
+            label, html = on_view_change(view_mode, new_sel, int(frame_idx), cache)
+            return view_mode, new_sel, int(frame_idx), label, html
+        new_idx = max(0, int(frame_idx) - 1)
+        label, html = on_view_change(view_mode, int(view_sel), new_idx, cache)
+        return view_mode, int(view_sel), new_idx, label, html
+
+    def on_next(view_mode, view_sel, frame_idx, cache):
+        view_mode = str(view_mode)
+        if view_mode == "head":
+            new_sel = min(num_heads - 1, int(view_sel) + 1)
+            label, html = on_view_change(view_mode, new_sel, int(frame_idx), cache)
+            return view_mode, new_sel, int(frame_idx), label, html
+        if view_mode == "layer":
+            new_sel = min(num_layers - 1, int(view_sel) + 1)
+            label, html = on_view_change(view_mode, new_sel, int(frame_idx), cache)
+            return view_mode, new_sel, int(frame_idx), label, html
+        S_cur = int(attn_holder.get("S", 1))
+        new_idx = min(max(0, S_cur - 1), int(frame_idx) + 1)
+        label, html = on_view_change(view_mode, int(view_sel), new_idx, cache)
+        return view_mode, int(view_sel), new_idx, label, html
+
+    def _run_reconstruction(conf_thres, max_points, cache):
         out_dir = output_dir / "reconstruction"
         out_dir.mkdir(parents=True, exist_ok=True)
         glb_path = out_dir / "reconstruction.glb"
 
-        if len(images.shape) == 4:
-            images_for_model = images.unsqueeze(0)
+        if attn_holder.get("preds") is not None and scene_holder.get("frames_uint8") is not None:
+            preds = attn_holder["preds"]
+            # Rebuild images_b in expected layout for coloring (B,S,3,H,W) in [0,1]
+            frames = scene_holder["frames_uint8"].astype(np.float32) / 255.0
+            images_for_model = np.transpose(frames, (0, 3, 1, 2))[None, ...]
         else:
-            images_for_model = images
+            images_b = scene_holder.get("images_b")
+            if images_b is None:
+                return None, "No images loaded"
+            images_for_model = images_b.to(device)
 
-        images_for_model = images_for_model.to(device)
-
-        with torch.no_grad():
-            if dtype != torch.float32:
-                with torch.cuda.amp.autocast(dtype=dtype):
+            with torch.no_grad():
+                if dtype != torch.float32:
+                    with torch.cuda.amp.autocast(dtype=dtype):
+                        preds = model(images_for_model)
+                else:
                     preds = model(images_for_model)
-            else:
-                preds = model(images_for_model)
 
         glb = _predictions_to_colored_pointcloud_glb(
             preds,
@@ -381,41 +648,228 @@ def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=Fals
         )
         return glb, "Reconstruction exported"
 
-    with gr.Blocks() as demo:
-        with gr.Tabs():
-            with gr.TabItem("Attention"):
-                gr.Markdown("## VGGT Global Attention\nClick frame 0 to choose a query patch. This visualizes how that query patch distributes attention over patches in each frame (including frame 0 unless disabled).")
-                cache = gr.State(None)
-
+    with gr.Blocks(
+        css="""
+        /* Keep layout stable: let the page size naturally and only scroll inside the grid area. */
+        #attn-grid { max-height: 72vh; overflow: auto; }
+        #frame_nav { align-items: center; }
+        #frame_nav .centered { display:flex; justify-content:center; align-items:center; width:100%; }
+        .frame-label { width:100%; text-align:center; font-size: 18px; font-weight: 600; }
+        """,
+    ) as demo:
+        cache = gr.State(None)
+        frame_state = gr.State(0)
+        query_frame_state = gr.State(0)
+        view_mode = gr.State("default")
+        view_sel = gr.State(0)
+        with gr.Row(elem_id="attn-dashboard"):
+            with gr.Column(scale=1):
+                patch_preview = gr.Image(value=_render_patch_grid_preview(frames0_uint8[0], model.aggregator.patch_size, None, _compute_patch_grid(H0, W0, model.aggregator.patch_size)[1], _compute_patch_grid(H0, W0, model.aggregator.patch_size)[0]), label="query frame (patches)", interactive=True)
                 with gr.Row():
-                    img = gr.Image(value=frame0, label="Frame 0", interactive=True)
-                    with gr.Column():
-                        block_sel = gr.Dropdown(
-                            choices=[str(i) for i in range(num_global_blocks)],
-                            value=str(num_global_blocks - 1),
-                            label="Global attention block",
-                        )
-                        head_sel = gr.Dropdown(choices=head_choices, value="avg", label="Head")
-                        include_frame0 = gr.Checkbox(value=True, label="Include frame 0 overlay")
-                        status = gr.Textbox(value="click a patch", label="Status")
-
-                gallery = gr.Gallery(label="Attention overlays (per frame)", columns=4, rows=2, height=420)
-                img.select(on_select, inputs=[head_sel, block_sel, include_frame0, cache], outputs=[gallery, status, cache])
-                head_sel.change(on_head_change, inputs=[head_sel, include_frame0, cache], outputs=[gallery, status])
-                include_frame0.change(on_head_change, inputs=[head_sel, include_frame0, cache], outputs=[gallery, status])
-                block_sel.change(on_block_change, inputs=[block_sel, head_sel, include_frame0, cache], outputs=[gallery, status, cache])
-
-            with gr.TabItem("Reconstruction"):
-                gr.Markdown("## 3D reconstruction (colored point cloud)\nThis exports a `.glb` file and shows it in an interactive 3D viewer.")
+                    scene_dir_ui = gr.Textbox(value=str(Path("examples")), label="scene (dir)")
+                    load_scene_btn = gr.Button("Load", min_width=60)
+                scene_pick_ui = gr.File(file_count="directory", label="or pick folder")
+                query_frame_ui = gr.Slider(minimum=0, maximum=max(0, int(S0) - 1), value=0, step=1, label="query frame")
+                view_mode_ui = gr.Dropdown(choices=["default", "head", "layer"], value="default", label="view")
+                thumb_size_ui = gr.Slider(minimum=48, maximum=220, value=96, step=4, label="thumb size")
+                gr.Markdown("### reconstruct")
+                recon_view = gr.Model3D(height=420, zoom_speed=0.5, pan_speed=0.5)
                 with gr.Row():
-                    with gr.Column():
-                        conf_thres = gr.Slider(minimum=0.0, maximum=10.0, value=0.0, step=0.1, label="Confidence threshold")
-                        max_points = gr.Slider(minimum=10000, maximum=500000, value=250000, step=10000, label="Max points")
-                        recon_btn = gr.Button("Reconstruct", variant="primary")
-                        recon_status = gr.Textbox(value="", label="Status")
-                    recon_view = gr.Model3D(height=520, zoom_speed=0.5, pan_speed=0.5)
+                    conf_thres = gr.Slider(minimum=0.0, maximum=10.0, value=3.0, step=0.1, label="conf")
+                    max_points = gr.Slider(minimum=50000, maximum=300000, value=150000, step=10000, label="max pts")
+                with gr.Row():
+                    recon_btn = gr.Button("Reconstruct", variant="primary")
+                recon_status = gr.Textbox(value="", label="status")
 
-                recon_btn.click(_run_reconstruction, inputs=[conf_thres, max_points], outputs=[recon_view, recon_status])
+            with gr.Column(scale=3, elem_id="attn-right"):
+                with gr.Row(elem_id="frame_nav"):
+                    prev_btn = gr.Button("<", min_width=40)
+                    frame_label = gr.HTML("<div class='frame-label'>frame 0</div>", elem_classes=["centered"])
+                    next_btn = gr.Button(">", min_width=40)
+                grid_html = gr.HTML(value="", elem_id="attn-grid")
+
+        def _load_scene_dir(scene_dir: str, view_mode: str):
+            p = Path(scene_dir)
+            if not p.is_dir():
+                return gr.update(), gr.update(), gr.update(), gr.update(), None, "", _render_label(str(view_mode), 0, 0), 0
+            image_paths = sorted([x for x in p.iterdir() if x.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}])
+            if len(image_paths) == 0:
+                return gr.update(), gr.update(), gr.update(), gr.update(), None, "", _render_label(str(view_mode), 0, 0), 0
+            return _load_scene_paths([str(x) for x in image_paths], view_mode)
+
+        def _extract_file_paths(fobj):
+            paths = []
+            if fobj is None:
+                return paths
+            if isinstance(fobj, list):
+                items = fobj
+            else:
+                items = [fobj]
+            for it in items:
+                if isinstance(it, dict):
+                    p = it.get("path") or it.get("name") or it.get("orig_name")
+                else:
+                    p = getattr(it, "path", None) or getattr(it, "name", None)
+                if p is None:
+                    p = str(it)
+                p = str(p)
+                if p and not p.startswith("gr.update") and not p.startswith("update("):
+                    paths.append(p)
+            return paths
+
+        def _load_scene_paths(image_paths: list, view_mode: str):
+            print(f"[attn-ui] loading scene with {len(image_paths)} image(s)")
+            imgs = load_images([str(x) for x in image_paths])
+            imgs_b = _as_batched(imgs)
+            _, S, _, H, W = imgs_b.shape
+            print(f"[attn-ui] scene loaded: S={int(S)} frames")
+            frames_uint8 = (imgs_b[0].detach().cpu().permute(0, 2, 3, 1).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+
+            # update backend-only holder
+            scene_holder["images_b"] = imgs_b
+            scene_holder["frames_uint8"] = frames_uint8
+            scene_holder["S"] = int(S)
+            scene_holder["H"] = int(H)
+            scene_holder["W"] = int(W)
+
+            # reset attention holder
+            attn_holder["attn_all"] = None
+            attn_holder["preds"] = None
+            attn_holder["grid_h"] = None
+            attn_holder["grid_w"] = None
+            attn_holder["patch_start_idx"] = None
+            attn_holder["P"] = None
+            attn_holder["S"] = int(S)
+            attn_holder["html_cache"] = {}
+
+            patch_size = model.aggregator.patch_size
+            gh, gw = _compute_patch_grid(H, W, patch_size)
+            qf = int(np.random.randint(0, max(1, int(S))))
+            preview = _render_patch_grid_preview(frames_uint8[qf], patch_size, None, gw, gh)
+
+            # outputs: frame_state, query_frame_state, patch_preview, query_frame_ui, cache, grid_html, frame_label, view_sel
+            return (
+                0,
+                qf,
+                gr.update(value=preview),
+                gr.update(maximum=max(0, int(S) - 1), value=qf),
+                None,
+                "",
+                _render_label(str(view_mode), 0, 0),
+                0,
+            )
+
+        def _on_scene_pick_and_load(f, view_mode):
+            # If gradio provides a directory upload, it may actually provide a list of uploaded files.
+            file_paths = _extract_file_paths(f)
+            if len(file_paths) > 0:
+                # Always prefer loading exactly the uploaded file list; it is the most reliable
+                # across Gradio versions (directory uploads often get materialized as multiple files).
+                file_paths = sorted(file_paths)
+                try:
+                    common = os.path.commonpath(file_paths)
+                except Exception:
+                    common = str(Path(file_paths[0]).parent)
+                common_p = Path(common)
+                if common_p.suffix:
+                    common_p = common_p.parent
+                common_dir = str(common_p)
+
+                # If only a single file path is provided, try to expand to its parent dir.
+                if len(file_paths) == 1:
+                    try_dir = Path(file_paths[0]).parent
+                    if try_dir.is_dir():
+                        img_exts = {".jpg", ".jpeg", ".png", ".webp"}
+                        all_imgs = sorted([str(x) for x in try_dir.iterdir() if x.suffix.lower() in img_exts])
+                        if len(all_imgs) > 1:
+                            file_paths = all_imgs
+                    print(f"[attn-ui] directory upload yielded 1 file; using {len(file_paths)} file(s) from parent dir")
+
+                out = _load_scene_paths(file_paths, str(view_mode))
+                return (common_dir,) + out
+
+            path = _on_pick_folder(f)
+            if path is None or (not isinstance(path, str)) or len(path) == 0:
+                return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+
+            out = _load_scene_dir(path, str(view_mode))
+            # prepend the textbox update
+            return (path,) + out
+
+        def _on_pick_folder(f):
+            if f is None:
+                return None
+            # gr.File(directory) can return dict/list or a small object depending on gradio version
+            if isinstance(f, list) and len(f) > 0:
+                f = f[0]
+            if isinstance(f, dict):
+                path = f.get("path") or f.get("name") or f.get("orig_name")
+            else:
+                path = getattr(f, "path", None) or getattr(f, "name", None)
+            if path is None:
+                path = str(f)
+            # avoid huge repr strings from objects
+            path = str(path)
+            if path.startswith("gr.update") or path.startswith("update("):
+                return None
+            p = Path(path)
+            # Gradio's "directory" upload sometimes yields a representative file path; use its parent.
+            if p.exists() and p.is_file():
+                p = p.parent
+            # If the path doesn't exist locally (e.g. gradio temp handling), still prefer the parent dir.
+            if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+                p = p.parent
+            return str(p)
+
+        def _on_query_frame_change(qf):
+            frames_uint8 = scene_holder.get("frames_uint8")
+            if frames_uint8 is None:
+                return gr.update(), int(qf)
+            qf = int(qf)
+            S = int(scene_holder.get("S", len(frames_uint8)))
+            qf = max(0, min(max(0, S - 1), qf))
+            patch_size = model.aggregator.patch_size
+            gh, gw = _compute_patch_grid(int(scene_holder.get("H")), int(scene_holder.get("W")), patch_size)
+            preview = _render_patch_grid_preview(frames_uint8[qf], patch_size, None, gw, gh)
+            return gr.update(value=preview), qf
+
+        def _on_thumb_size_change(sz, cache, view_mode, view_sel, frame_idx):
+            if cache is None or not isinstance(cache, dict):
+                return cache, gr.update()
+            cache = dict(cache)
+            cache["thumb_size"] = int(sz)
+            if isinstance(attn_holder.get("html_cache"), dict):
+                attn_holder["html_cache"] = {}
+            label, html = on_view_change(str(view_mode), int(view_sel), int(frame_idx), cache)
+            return cache, html
+
+        def _on_view_mode_change_ui(m):
+            return str(m), 0
+
+        view_mode_ui.change(_on_view_mode_change_ui, inputs=[view_mode_ui], outputs=[view_mode, view_sel])
+        scene_pick_ui.change(
+            _on_scene_pick_and_load,
+            inputs=[scene_pick_ui, view_mode],
+            outputs=[scene_dir_ui, frame_state, query_frame_state, patch_preview, query_frame_ui, cache, grid_html, frame_label, view_sel],
+        )
+
+        load_scene_btn.click(
+            _load_scene_dir,
+            inputs=[scene_dir_ui, view_mode],
+            outputs=[frame_state, query_frame_state, patch_preview, query_frame_ui, cache, grid_html, frame_label, view_sel],
+        )
+        query_frame_ui.change(_on_query_frame_change, inputs=[query_frame_ui], outputs=[patch_preview, query_frame_state])
+
+        view_mode.change(on_view_change, inputs=[view_mode, view_sel, frame_state, cache], outputs=[frame_label, grid_html])
+        view_sel.change(on_view_change, inputs=[view_mode, view_sel, frame_state, cache], outputs=[frame_label, grid_html])
+
+        patch_preview.select(on_select, inputs=[frame_state, query_frame_state, view_mode, view_sel, thumb_size_ui, cache], outputs=[patch_preview, frame_label, grid_html, cache])
+
+        thumb_size_ui.change(_on_thumb_size_change, inputs=[thumb_size_ui, cache, view_mode, view_sel, frame_state], outputs=[cache, grid_html])
+
+        prev_btn.click(on_prev, inputs=[view_mode, view_sel, frame_state, cache], outputs=[view_mode, view_sel, frame_state, frame_label, grid_html])
+        next_btn.click(on_next, inputs=[view_mode, view_sel, frame_state, cache], outputs=[view_mode, view_sel, frame_state, frame_label, grid_html])
+        recon_btn.click(_run_reconstruction, inputs=[conf_thres, max_points, cache], outputs=[recon_view, recon_status])
 
     server_name = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
     server_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
