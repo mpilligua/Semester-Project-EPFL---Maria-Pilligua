@@ -453,6 +453,105 @@ def _render_attention_grid_html(attn_all, frames_uint8, S, mode, sel, frame_idx,
     return style
 
 
+def _render_attention_grid_image(attn_all, frames_uint8, S, mode, sel, frame_idx, grid_h, grid_w, patch_start_idx, P, num_heads, num_layers, cell=96, gap=2):
+    cell = int(cell)
+    gap = int(gap)
+    header_h = 22
+    left_w = 46
+
+    def _blank(w, h, color=(255, 255, 255)):
+        return Image.new("RGB", (int(w), int(h)), color)
+
+    def _paste_rgb(img_pil, rgb_uint8, x, y):
+        im = Image.fromarray(rgb_uint8)
+        if im.size != (cell, cell):
+            im = im.resize((cell, cell), Image.Resampling.BILINEAR)
+        img_pil.paste(im, (int(x), int(y)))
+
+    def _draw_centered(draw, box, text, fill=(55, 65, 81)):
+        x0, y0, x1, y1 = box
+        w = max(1, int(x1 - x0))
+        h = max(1, int(y1 - y0))
+        try:
+            tw, th = draw.textbbox((0, 0), text)[2:]
+        except Exception:
+            tw, th = draw.textsize(text)
+        tx = int(x0 + (w - tw) / 2)
+        ty = int(y0 + (h - th) / 2)
+        draw.text((tx, ty), text, fill=fill)
+
+    if mode == "default":
+        num_heads_show = min(int(num_heads), 8)
+        ncols = int(num_layers)
+        nrows = int(num_heads_show)
+        W = left_w + gap + ncols * cell + max(0, ncols - 1) * gap
+        H = header_h + gap + nrows * cell + max(0, nrows - 1) * gap
+        out = _blank(W, H)
+        draw = ImageDraw.Draw(out)
+        for l in range(num_layers):
+            x = left_w + gap + l * (cell + gap)
+            _draw_centered(draw, (x, 0, x + cell, header_h), f"L{l}")
+        frame_rgb_uint8 = frames_uint8[int(frame_idx)]
+        for h in range(num_heads_show):
+            y = header_h + gap + h * (cell + gap)
+            _draw_centered(draw, (0, y, left_w, y + cell), f"H{h}")
+            for l in range(num_layers):
+                x = left_w + gap + l * (cell + gap)
+                rgb = _attention_thumbnail_overlay_rgb(
+                    attn_all[l], S, frame_idx, frame_rgb_uint8, grid_h, grid_w, patch_start_idx, P, h, out_size=cell
+                )
+                _paste_rgb(out, rgb, x, y)
+        return out
+
+    if mode == "head":
+        head_idx = int(sel)
+        ncols = int(num_layers)
+        nrows = int(S)
+        W = left_w + gap + ncols * cell + max(0, ncols - 1) * gap
+        H = header_h + gap + nrows * cell + max(0, nrows - 1) * gap
+        out = _blank(W, H)
+        draw = ImageDraw.Draw(out)
+        for l in range(num_layers):
+            x = left_w + gap + l * (cell + gap)
+            _draw_centered(draw, (x, 0, x + cell, header_h), f"L{l}")
+        for f in range(S):
+            y = header_h + gap + f * (cell + gap)
+            _draw_centered(draw, (0, y, left_w, y + cell), f"F{f}")
+            frame_rgb_uint8 = frames_uint8[int(f)]
+            for l in range(num_layers):
+                x = left_w + gap + l * (cell + gap)
+                rgb = _attention_thumbnail_overlay_rgb(
+                    attn_all[l], S, f, frame_rgb_uint8, grid_h, grid_w, patch_start_idx, P, head_idx, out_size=cell
+                )
+                _paste_rgb(out, rgb, x, y)
+        return out
+
+    if mode == "layer":
+        layer_idx = int(sel)
+        ncols = int(S)
+        nrows = int(num_heads)
+        W = left_w + gap + ncols * cell + max(0, ncols - 1) * gap
+        H = header_h + gap + nrows * cell + max(0, nrows - 1) * gap
+        out = _blank(W, H)
+        draw = ImageDraw.Draw(out)
+        for f in range(S):
+            x = left_w + gap + f * (cell + gap)
+            _draw_centered(draw, (x, 0, x + cell, header_h), f"F{f}")
+        for h in range(num_heads):
+            y = header_h + gap + h * (cell + gap)
+            _draw_centered(draw, (0, y, left_w, y + cell), f"H{h}")
+            for f in range(S):
+                x = left_w + gap + f * (cell + gap)
+                frame_rgb_uint8 = frames_uint8[int(f)]
+                rgb = _attention_thumbnail_overlay_rgb(
+                    attn_all[layer_idx], S, f, frame_rgb_uint8, grid_h, grid_w, patch_start_idx, P, h, out_size=cell
+                )
+                _paste_rgb(out, rgb, x, y)
+        return out
+
+    return _blank(1, 1)
+
+
 def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=False):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -672,6 +771,9 @@ def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=Fals
                 query_frame_ui = gr.Slider(minimum=0, maximum=max(0, int(S0) - 1), value=0, step=1, label="query frame")
                 view_mode_ui = gr.Dropdown(choices=["default", "head", "layer"], value="default", label="view")
                 thumb_size_ui = gr.Slider(minimum=48, maximum=220, value=96, step=4, label="thumb size")
+                with gr.Row():
+                    download_grid_btn = gr.Button("Download grid", min_width=160)
+                    download_grid_file = gr.File(label="grid.png")
                 gr.Markdown("### reconstruct")
                 recon_view = gr.Model3D(height=420, zoom_speed=0.5, pan_speed=0.5)
                 with gr.Row():
@@ -843,6 +945,41 @@ def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=Fals
             label, html = on_view_change(str(view_mode), int(view_sel), int(frame_idx), cache)
             return cache, html
 
+        def _export_grid_png(view_mode, view_sel, frame_idx, cache):
+            attn_all = attn_holder.get("attn_all")
+            frames_uint8 = scene_holder.get("frames_uint8")
+            if attn_all is None or frames_uint8 is None:
+                return None
+            grid_h = attn_holder.get("grid_h")
+            grid_w = attn_holder.get("grid_w")
+            patch_start_idx = attn_holder.get("patch_start_idx")
+            P = attn_holder.get("P")
+            S = int(scene_holder.get("S", len(frames_uint8)))
+            if grid_h is None or grid_w is None or patch_start_idx is None or P is None:
+                return None
+            thumb_size = 96
+            if isinstance(cache, dict) and cache.get("thumb_size") is not None:
+                thumb_size = int(cache["thumb_size"])
+            img = _render_attention_grid_image(
+                attn_all,
+                frames_uint8,
+                S,
+                str(view_mode),
+                int(view_sel),
+                int(frame_idx),
+                int(grid_h),
+                int(grid_w),
+                int(patch_start_idx),
+                int(P),
+                int(num_heads),
+                int(num_layers),
+                cell=int(thumb_size),
+                gap=2,
+            )
+            out_path = output_dir / f"attn_grid_{int(time.time()*1000)}.png"
+            img.save(str(out_path))
+            return str(out_path)
+
         def _on_view_mode_change_ui(m):
             return str(m), 0
 
@@ -866,6 +1003,12 @@ def _gradio_attention_ui(model, images, device, dtype, output_dir, validate=Fals
         patch_preview.select(on_select, inputs=[frame_state, query_frame_state, view_mode, view_sel, thumb_size_ui, cache], outputs=[patch_preview, frame_label, grid_html, cache])
 
         thumb_size_ui.change(_on_thumb_size_change, inputs=[thumb_size_ui, cache, view_mode, view_sel, frame_state], outputs=[cache, grid_html])
+
+        download_grid_btn.click(
+            _export_grid_png,
+            inputs=[view_mode, view_sel, frame_state, cache],
+            outputs=[download_grid_file],
+        )
 
         prev_btn.click(on_prev, inputs=[view_mode, view_sel, frame_state, cache], outputs=[view_mode, view_sel, frame_state, frame_label, grid_html])
         next_btn.click(on_next, inputs=[view_mode, view_sel, frame_state, cache], outputs=[view_mode, view_sel, frame_state, frame_label, grid_html])
