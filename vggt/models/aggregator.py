@@ -15,6 +15,7 @@ from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
 from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from vggt.utils.multi_view_matcher import MultiViewMatcher
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +69,16 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        enable_sparse_attention=False,
+        matching_gt=None,
     ):
         super().__init__()
 
         self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
+
+        # Store configuration
+        self.img_size = img_size
+        self.patch_size = patch_size
 
         # Initialize rotary position embedding if frequency > 0
         self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
@@ -142,6 +149,15 @@ class Aggregator(nn.Module):
 
         self._capture_global_attention_enabled = False
         self._capture_global_attention_block_idx = None
+        
+        # Sparse attention configuration
+        self.enable_sparse_attention = enable_sparse_attention
+        self.multi_view_matcher = MultiViewMatcher(patch_size=patch_size, img_size=img_size) if enable_sparse_attention else None
+        self.cached_sparse_mask = None
+        self.cached_sparse_mask_info = None
+        
+        # Store matching_gt if provided
+        self.matching_gt = matching_gt
 
     def __build_patch_embed__(
         self,
@@ -195,60 +211,41 @@ class Aggregator(nn.Module):
                 The list of outputs from the attention blocks,
                 and the patch_start_idx indicating where patch tokens begin.
         """
-        print("\n[Aggregator.forward] BEGIN")
-        print(f"  Input images shape: {images.shape}")
-        
         B, S, C_in, H, W = images.shape
-        print(f"  Batch={B}, Sequence={S}, Channels={C_in}, Height={H}, Width={W}")
+        logger.debug(f"Aggregator.forward: B={B}, S={S}, C={C_in}, H={H}, W={W}")
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
 
         # Normalize images and reshape for patch embed
-        print(f"\n  [Step 1] Normalizing images (ResNet mean/std)")
         images = (images - self._resnet_mean) / self._resnet_std
-        print(f"    Normalized range: [{images.min():.4f}, {images.max():.4f}]")
 
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)
-        print(f"\n  [Step 2] Patch embedding")
-        print(f"    Reshaped to: {images.shape}")
         patch_tokens = self.patch_embed(images)
-        print(f"    Patch tokens shape: {patch_tokens.shape if isinstance(patch_tokens, torch.Tensor) else type(patch_tokens)}")
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
-            print(f"    Extracted 'x_norm_patchtokens': {patch_tokens.shape}")
 
         _, P, C = patch_tokens.shape
-        print(f"    P (num patches)={P}, C (embed_dim)={C}")
 
         # Expand camera and register tokens to match batch size and sequence length
-        print(f"\n  [Step 3] Special tokens (camera & register)")
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
         register_token = slice_expand_and_flatten(self.register_token, B, S)
-        print(f"    Camera token shape: {camera_token.shape}")
-        print(f"    Register token shape: {register_token.shape}")
 
         # Concatenate special tokens with patch tokens
-        print(f"\n  [Step 4] Concatenate special + patch tokens")
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
-        print(f"    Combined tokens shape: {tokens.shape}")
 
         pos = None
         if self.rope is not None:
-            print(f"\n  [Step 5] Rotary position embeddings (RoPE)")
             pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
-            print(f"    Pos shape: {pos.shape}")
 
         if self.patch_start_idx > 0:
             # do not use position embedding for special tokens (camera and register tokens)
             # so set pos to 0 for the special tokens
-            print(f"    Masking positions for special tokens (first {self.patch_start_idx} tokens)")
             pos = pos + 1
             pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
-            print(f"    Final pos shape: {pos.shape}")
 
         # update P because we added special tokens
         _, P, C = tokens.shape
@@ -256,21 +253,95 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         output_list = []
-
-        print(f"\n  [Step 6] Alternating Attention ({self.aa_block_num} blocks)")
-        print(f"    Attention order: {self.aa_order}, block_size: {self.aa_block_size}")
+        
+        # Compute sparse attention masks if enabled
+        attn_mask_frame = None
+        attn_mask_global = None
+        if self.enable_sparse_attention and self.multi_view_matcher is not None:
+            # Only use the first S views from matching_gt
+            # matching_gt shape: [B, S_src, H_src, W_src, S_dst, H_dst, W_dst]
+            if self.matching_gt is not None:
+                # Slice both source and destination dimensions
+                matching_gt_subset = self.matching_gt[:, :S, :, :, :S, :, :]
+                
+                # Update the matcher's dimensions for non-square images
+                patch_h = H // self.patch_size
+                patch_w = W // self.patch_size
+                self.multi_view_matcher.num_patches_h = patch_h
+                self.multi_view_matcher.num_patches_w = patch_w
+                self.multi_view_matcher.num_tokens_per_view = patch_h * patch_w
+            else:
+                matching_gt_subset = None
+            
+            attn_mask, mask_info = self.multi_view_matcher(
+                depths=None,  # Not using camera geometry, will use matching_gt
+                intrinsics=None,
+                extrinsics=None,
+                matching_gt=matching_gt_subset,
+            )
+            logger.debug(f"Sparse mask: {attn_mask.shape}, info: {mask_info}")
+            
+            # For frame attention: each frame processes independently
+            # Frame attention operates within a single frame, no cross-view masking needed
+            attn_mask_frame = None  # Full attention within frames
+            
+            # For global attention: [B, S*tokens, S*tokens]
+            attn_mask_global = attn_mask.to(device=tokens.device, dtype=tokens.dtype)
+            
+            # Pad mask to include special tokens (camera + register tokens)
+            # attn_mask is [B, S*num_patch_tokens, S*num_patch_tokens]
+            # We need [B, S*(num_patch_tokens + num_special), S*(num_patch_tokens + num_special)]
+            num_special_per_view = self.patch_start_idx  # 5 (1 camera + 4 register)
+            num_patch_tokens = self.multi_view_matcher.num_tokens_per_view
+            total_tokens_per_view = num_patch_tokens + num_special_per_view
+            
+            # Initialize with zeros (all masked)
+            padded_mask = torch.zeros(
+                (B, S * total_tokens_per_view, S * total_tokens_per_view),
+                device=attn_mask_global.device,
+                dtype=attn_mask_global.dtype
+            )
+            
+            for s in range(S):
+                s_start = s * total_tokens_per_view
+                s_special_end = s_start + num_special_per_view
+                s_patch_start = s_special_end
+                s_patch_end = s_start + total_tokens_per_view
+                
+                for s2 in range(S):
+                    s2_start = s2 * total_tokens_per_view
+                    s2_special_end = s2_start + num_special_per_view
+                    s2_patch_start = s2_special_end
+                    s2_patch_end = s2_start + total_tokens_per_view
+                    
+                    if s == s2:
+                        # Same view: full attention for all tokens
+                        padded_mask[:, s_start:s_patch_end, s2_start:s2_patch_end] = 1.0
+                    else:
+                        # Cross-view: special tokens can attend to other special tokens
+                        padded_mask[:, s_start:s_special_end, s2_start:s2_special_end] = 1.0
+                        
+                        # Cross-view patch-to-patch: only correspondences
+                        padded_mask[:, s_patch_start:s_patch_end, s2_patch_start:s2_patch_end] = \
+                            attn_mask_global[:, 
+                                s * num_patch_tokens:(s + 1) * num_patch_tokens,
+                                s2 * num_patch_tokens:(s2 + 1) * num_patch_tokens]
+            
+            attn_mask_global = padded_mask
+            
+            total_entries = attn_mask_global.numel()
+            nonzero = (attn_mask_global > 0).sum().item()
+            logger.debug(f"Padded mask: {attn_mask_global.shape}, sparsity: {nonzero/total_entries:.4f}")
 
         for block_num in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
-                    print(f"    Block {block_num}, Frame attention (block {frame_idx})...")
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, B, S, P, C, frame_idx, pos=pos
+                        tokens, B, S, P, C, frame_idx, pos=pos, attn_mask=attn_mask_frame
                     )
                 elif attn_type == "global":
-                    print(f"    Block {block_num}, Global attention (block {global_idx})...")
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, attn_mask=attn_mask_global
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -279,16 +350,12 @@ class Aggregator(nn.Module):
                 # concat frame and global intermediates, [B x S x P x 2C]
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                 output_list.append(concat_inter)
-                if i == 0:
-                    print(f"      Output intermediate shape: {concat_inter.shape}, range [{concat_inter.min():.4f}, {concat_inter.max():.4f}]")
 
         del concat_inter
         del frame_intermediates
         del global_intermediates
         
-        print(f"\n  [Aggregator.forward] COMPLETE")
-        print(f"    Total outputs: {len(output_list)}, patch_start_idx: {self.patch_start_idx}")
-        print("="*80 + "\n")
+        logger.debug(f"Aggregator complete: {len(output_list)} outputs, sparse={self.enable_sparse_attention}")
         return output_list, self.patch_start_idx
 
     def enable_global_attention_capture(
@@ -373,9 +440,42 @@ class Aggregator(nn.Module):
             out.append(getattr(blk.attn, "captured_attention", None))
         return out
 
-    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+    # ── QK capture (store Q/K for on-the-fly attention recomputation) ─────
+
+    def enable_global_qk_capture(self) -> None:
+        """Enable Q/K capture on all global attention blocks."""
+        for blk in self.global_blocks:
+            blk.attn.capture_qk = True
+            blk.attn.captured_q = None
+            blk.attn.captured_k = None
+
+    def disable_global_qk_capture(self) -> None:
+        """Disable Q/K capture and free stored tensors."""
+        for blk in self.global_blocks:
+            blk.attn.capture_qk = False
+            blk.attn.captured_q = None
+            blk.attn.captured_k = None
+
+    def get_captured_qk_all(self) -> List[tuple]:
+        """Return list of (Q, K) tuples from all global blocks. Each is [B,H,N,D] on CPU fp16."""
+        out = []
+        for blk in self.global_blocks:
+            q = getattr(blk.attn, "captured_q", None)
+            k = getattr(blk.attn, "captured_k", None)
+            out.append((q, k))
+        return out
+
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None, attn_mask=None):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
+        
+        Args:
+            tokens: Token tensor [B*S, P, C]
+            B, S: Batch size and sequence length
+            P, C: Patch dimension and channel dimension
+            frame_idx: Current frame block index
+            pos: Optional positional encodings
+            attn_mask: Optional attention mask [B*S, P, P]
         """
         # If needed, reshape tokens or positions:
         if tokens.shape != (B * S, P, C):
@@ -388,20 +488,28 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for block_iter in range(self.aa_block_size):
-            print(f"        [Frame Block {frame_idx}, iter {block_iter}] input shape: {tokens.shape}, range [{tokens.min():.4f}, {tokens.max():.4f}]")
+            # logger.debug(f"Frame Block {frame_idx}, iter {block_iter}: {tokens.shape}")
             if self.training:
-                tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, attn_mask, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
-            print(f"        [Frame Block {frame_idx}, iter {block_iter}] output shape: {tokens.shape}, range [{tokens.min():.4f}, {tokens.max():.4f}]")
+                tokens = self.frame_blocks[frame_idx](tokens, pos=pos, attn_mask=attn_mask)
+            # logger.debug(f"Frame Block {frame_idx}, iter {block_iter} out: {tokens.shape}")
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, attn_mask=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
+        
+        Args:
+            tokens: Token tensor [B, S*P, C]
+            B, S: Batch size and sequence length
+            P, C: Patch dimension and channel dimension
+            global_idx: Current global block index
+            pos: Optional positional encodings
+            attn_mask: Optional attention mask [B, S*P, S*P]
         """
         if tokens.shape != (B, S * P, C):
             tokens = tokens.view(B, S, P, C).view(B, S * P, C)
@@ -413,12 +521,12 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for block_iter in range(self.aa_block_size):
-            print(f"        [Global Block {global_idx}, iter {block_iter}] input shape: {tokens.shape}, range [{tokens.min():.4f}, {tokens.max():.4f}]")
+            # logger.debug(f"Global Block {global_idx}, iter {block_iter}: {tokens.shape}")
             if self.training:
-                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, attn_mask, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
-            print(f"        [Global Block {global_idx}, iter {block_iter}] output shape: {tokens.shape}, range [{tokens.min():.4f}, {tokens.max():.4f}]")
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)
+            # logger.debug(f"Global Block {global_idx}, iter {block_iter} out: {tokens.shape}")
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 

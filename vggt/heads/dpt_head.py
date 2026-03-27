@@ -134,13 +134,13 @@ class DPTHead(nn.Module):
                 - If feature_only=True: Feature maps with shape [B, S, C, H, W]
                 - Otherwise: Tuple of (predictions, confidence) both with shape [B, S, 1, H, W]
         """
-        print(f"\n[DPTHead.forward] INPUT")
-        print(f"  Aggregated tokens list length: {len(aggregated_tokens_list)}")
-        print(f"  Last token shape: {aggregated_tokens_list[-1].shape}")
+        # print(f"\n[DPTHead.forward] INPUT")
+        # print(f"  Aggregated tokens list length: {len(aggregated_tokens_list)}")
+        # print(f"  Last token shape: {aggregated_tokens_list[-1].shape}")
         
         B, S, _, H, W = images.shape
-        print(f"  Images shape: [{B}, {S}, 3, {H}, {W}]")
-        print(f"  Activation: {self.activation}, Conf activation: {self.conf_activation}")
+        # print(f"  Images shape: [{B}, {S}, 3, {H}, {W}]")
+        # print(f"  Activation: {self.activation}, Conf activation: {self.conf_activation}")
 
         # If frames_chunk_size is not specified or greater than S, process all frames at once
         if frames_chunk_size is None or frames_chunk_size >= S:
@@ -199,17 +199,17 @@ class DPTHead(nn.Module):
             Tensor or Tuple[Tensor, Tensor]: Feature maps or (predictions, confidence).
         """
         if frames_start_idx is not None and frames_end_idx is not None:
-            print(f"  _forward_impl: Processing frames [{frames_start_idx}:{frames_end_idx}]")
+            # print(f"  _forward_impl: Processing frames [{frames_start_idx}:{frames_end_idx}]")
             images = images[:, frames_start_idx:frames_end_idx].contiguous()
 
         B, S, _, H, W = images.shape
-        print(f"  _forward_impl: Processing shape B={B}, S={S}, H={H}, W={W}")
+        # print(f"  _forward_impl: Processing shape B={B}, S={S}, H={H}, W={W}")
 
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
 
         out = []
         dpt_idx = 0
-        print(f"  DPT fusion layers: indices {self.intermediate_layer_idx}")
+        # print(f"  DPT fusion layers: indices {self.intermediate_layer_idx}")
 
         for layer_idx in self.intermediate_layer_idx:
             x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
@@ -223,21 +223,21 @@ class DPTHead(nn.Module):
             x = self.norm(x)
 
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
-            print(f"    Layer {layer_idx} → {dpt_idx}: Shape after projects: {x.shape}")
+            # print(f"    Layer {layer_idx} → {dpt_idx}: Shape after projects: {x.shape}")
 
             x = self.projects[dpt_idx](x)
             if self.pos_embed:
                 x = self._apply_pos_embed(x, W, H)
             x = self.resize_layers[dpt_idx](x)
-            print(f"    Layer {layer_idx} → {dpt_idx}: Shape after resize: {x.shape}")
+            # print(f"    Layer {layer_idx} → {dpt_idx}: Shape after resize: {x.shape}")
 
             out.append(x)
             dpt_idx += 1
 
         # Fuse features from multiple layers.
-        print(f"  Fusing {len(out)} feature layers...")
+        # print(f"  Fusing {len(out)} feature layers...")
         out = self.scratch_forward(out)
-        print(f"  After fusion: {out.shape}")
+        # print(f"  After fusion: {out.shape}")
         
         # Interpolate fused output to match target image resolution.
         out = custom_interpolate(
@@ -246,7 +246,7 @@ class DPTHead(nn.Module):
             mode="bilinear",
             align_corners=True,
         )
-        print(f"  After interpolation: {out.shape}")
+        # print(f"  After interpolation: {out.shape}")
 
         if self.pos_embed:
             out = self._apply_pos_embed(out, W, H)
@@ -260,8 +260,8 @@ class DPTHead(nn.Module):
         preds = preds.view(B, S, *preds.shape[1:])
         conf = conf.view(B, S, *conf.shape[1:])
         
-        print(f"  [DPTHead] OUTPUT predictions: {preds.shape}, range [{preds.min():.4f}, {preds.max():.4f}]")
-        print(f"  [DPTHead] OUTPUT confidence: {conf.shape}, range [{conf.min():.4f}, {conf.max():.4f}]")
+        # print(f"  [DPTHead] OUTPUT predictions: {preds.shape}, range [{preds.min():.4f}, {preds.max():.4f}]")
+        # print(f"  [DPTHead] OUTPUT confidence: {conf.shape}, range [{conf.min():.4f}, {conf.max():.4f}]")
         
         return preds, conf
 

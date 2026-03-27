@@ -82,9 +82,9 @@ class CameraHead(nn.Module):
         Returns:
             list: A list of predicted camera encodings (post-activation) from each iteration.
         """
-        print(f"\n[CameraHead.forward] INPUT")
-        print(f"  Aggregated tokens list length: {len(aggregated_tokens_list)}")
-        print(f"  Last token shape: {aggregated_tokens_list[-1].shape}")
+        # print(f"\n[CameraHead.forward] INPUT")
+        # print(f"  Aggregated tokens list length: {len(aggregated_tokens_list)}")
+        # print(f"  Last token shape: {aggregated_tokens_list[-1].shape}")
         
         # Use tokens from the last block for camera prediction.
         tokens = aggregated_tokens_list[-1]
@@ -92,13 +92,13 @@ class CameraHead(nn.Module):
         # Extract the camera tokens
         pose_tokens = tokens[:, :, 0]
         pose_tokens = self.token_norm(pose_tokens)
-        print(f"  Camera pose tokens shape: {pose_tokens.shape}, range [{pose_tokens.min():.4f}, {pose_tokens.max():.4f}]")
+        # print(f"  Camera pose tokens shape: {pose_tokens.shape}, range [{pose_tokens.min():.4f}, {pose_tokens.max():.4f}]")
 
         pred_pose_enc_list = self.trunk_fn(pose_tokens, num_iterations)
         
-        print(f"[CameraHead.forward] OUTPUT: {len(pred_pose_enc_list)} predictions")
-        print(f"  Final pose encoding shape: {pred_pose_enc_list[-1].shape}")
-        print(f"  Range: [{pred_pose_enc_list[-1].min():.4f}, {pred_pose_enc_list[-1].max():.4f}]")
+        # print(f"[CameraHead.forward] OUTPUT: {len(pred_pose_enc_list)} predictions")
+        # print(f"  Final pose encoding shape: {pred_pose_enc_list[-1].shape}")
+        # print(f"  Range: [{pred_pose_enc_list[-1].min():.4f}, {pred_pose_enc_list[-1].max():.4f}]")
         
         return pred_pose_enc_list
 
@@ -114,7 +114,7 @@ class CameraHead(nn.Module):
             list: List of activated camera encodings from each iteration.
         """
         B, S, C = pose_tokens.shape
-        print(f"\n  [CameraHead.trunk_fn] Iterative refinement with {num_iterations} iterations")
+        # print(f"\n  [CameraHead.trunk_fn] Iterative refinement with {num_iterations} iterations")
         
         pred_pose_enc = None
         pred_pose_enc_list = []
@@ -123,12 +123,12 @@ class CameraHead(nn.Module):
             # Use a learned empty pose for the first iteration.
             if pred_pose_enc is None:
                 module_input = self.embed_pose(self.empty_pose_tokens.expand(B, S, -1))
-                print(f"    Iteration {iter_idx}: Initial pose (empty token)")
+                # print(f"    Iteration {iter_idx}: Initial pose (empty token)")
             else:
                 # Detach the previous prediction to avoid backprop through time.
                 pred_pose_enc = pred_pose_enc.detach()
                 module_input = self.embed_pose(pred_pose_enc)
-                print(f"    Iteration {iter_idx}: Refined from previous iteration")
+                # print(f"    Iteration {iter_idx}: Refined from previous iteration")
 
             # Generate modulation parameters and split them into shift, scale, and gate components.
             shift_msa, scale_msa, gate_msa = self.poseLN_modulation(module_input).chunk(3, dim=-1)
@@ -150,7 +150,7 @@ class CameraHead(nn.Module):
             activated_pose = activate_pose(
                 pred_pose_enc, trans_act=self.trans_act, quat_act=self.quat_act, fl_act=self.fl_act
             )
-            print(f"      Output shape: {activated_pose.shape}, range [{activated_pose.min():.4f}, {activated_pose.max():.4f}]")
+            # print(f"      Output shape: {activated_pose.shape}, range [{activated_pose.min():.4f}, {activated_pose.max():.4f}]")
             pred_pose_enc_list.append(activated_pose)
 
         return pred_pose_enc_list

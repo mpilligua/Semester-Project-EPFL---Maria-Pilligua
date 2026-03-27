@@ -36,3 +36,6 @@ model_weights/
 checkpoint/
 .hydra/
 outputs/
+.gradio/certificate.pem
+input_images_20260325_104342_493705/*
+input_images_*/*

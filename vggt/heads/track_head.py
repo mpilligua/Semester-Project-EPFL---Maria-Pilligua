@@ -88,31 +88,31 @@ class TrackHead(nn.Module):
                 - vis_scores (torch.Tensor): Visibility scores for tracked points.
                 - conf_scores (torch.Tensor): Confidence scores for tracked points (if predict_conf=True).
         """
-        print(f"\n[TrackHead.forward] INPUT")
-        print(f"  Aggregated tokens: {len(aggregated_tokens_list)} lists")
+        # print(f"\n[TrackHead.forward] INPUT")
+        # print(f"  Aggregated tokens: {len(aggregated_tokens_list)} lists")
         
         B, S, _, H, W = images.shape
-        print(f"  Images shape: [{B}, {S}, 3, {H}, {W}]")
+        # print(f"  Images shape: [{B}, {S}, 3, {H}, {W}]")
         if query_points is not None:
             print(f"  Query points shape: {query_points.shape}")
 
         # Extract features from tokens
         # feature_maps has shape (B, S, C, H//2, W//2) due to down_ratio=2
-        print(f"  Extracting features...")
+        # print(f"  Extracting features...")
         feature_maps = self.feature_extractor(aggregated_tokens_list, images, patch_start_idx)
-        print(f"  Feature maps shape: {feature_maps.shape}")
+        # print(f"  Feature maps shape: {feature_maps.shape}")
 
         # Use default iterations if not specified
         if iters is None:
             iters = self.iters
 
         # Perform tracking using the extracted features
-        print(f"  Running tracker with {iters} iterations...")
+        # print(f"  Running tracker with {iters} iterations...")
         coord_preds, vis_scores, conf_scores = self.tracker(query_points=query_points, fmaps=feature_maps, iters=iters)
 
-        print(f"[TrackHead.forward] OUTPUT")
-        print(f"  Coordinates: {coord_preds[-1].shape}, range [{coord_preds[-1].min():.4f}, {coord_preds[-1].max():.4f}]")
-        print(f"  Visibility: {vis_scores.shape}, range [{vis_scores.min():.4f}, {vis_scores.max():.4f}]")
-        print(f"  Confidence: {conf_scores.shape}, range [{conf_scores.min():.4f}, {conf_scores.max():.4f}]")
+        # print(f"[TrackHead.forward] OUTPUT")
+        # print(f"  Coordinates: {coord_preds[-1].shape}, range [{coord_preds[-1].min():.4f}, {coord_preds[-1].max():.4f}]")
+        # print(f"  Visibility: {vis_scores.shape}, range [{vis_scores.min():.4f}, {vis_scores.max():.4f}]")
+        # print(f"  Confidence: {conf_scores.shape}, range [{conf_scores.min():.4f}, {conf_scores.max():.4f}]")
 
         return coord_preds, vis_scores, conf_scores

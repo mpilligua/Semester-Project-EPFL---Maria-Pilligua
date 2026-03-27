@@ -5,16 +5,21 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-import cv2
+import sys
+
+# Set headless mode environment variables
+os.environ['DISPLAY'] = ''
+os.environ['LIBGL_ALWAYS_INDIRECT'] = '1'
+
 import torch
 import numpy as np
 import gradio as gr
-import sys
 import shutil
 from datetime import datetime
 import glob
 import gc
 import time
+from pathlib import Path
 
 sys.path.append("vggt/")
 
@@ -26,16 +31,57 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-print("Initializing and loading VGGT model...")
-# model = VGGT.from_pretrained("facebook/VGGT-1B")  # another way to load the model
-
+print("\n" + "="*60)
+print("VGGT Gradio App - Initialization Starting")
+print("="*60)
+print(f"Device: {device}")
+print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("\n[1/4] Initializing VGGT model architecture...")
 model = VGGT()
-_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+print("      ✓ Model architecture initialized")
 
+print("[2/4] Loading model weights...")
+# Load from cache to avoid hanging on HuggingFace download
+cached_model_path = os.path.expanduser("~/.cache/torch/hub/checkpoints/model.pt")
+if os.path.exists(cached_model_path):
+    print(f"      Loading cached model from {cached_model_path}")
+    model_state = torch.load(cached_model_path, map_location="cpu")
+else:
+    print("      Downloading model from HuggingFace (first time)...")
+    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+    model_state = torch.hub.load_state_dict_from_url(_URL)
 
+print("      ✓ Weights loaded, setting model state...")
+model.load_state_dict(model_state)
+print("      ✓ Model state set")
+
+print("      ✓ Setting model to eval mode and moving to device...")
 model.eval()
 model = model.to(device)
+print(f"      ✓ Model on device: {device}")
+
+# Global variable to store matching GT data
+print("[3/4] Loading sparse attention correspondence masks...")
+MATCHING_GT = None
+try:
+    # Try multiple possible locations for matching_gt
+    possible_paths = [
+        "notebooks/matching_data/matching_gt.npy",
+        "/scratch/cvlab/home/pilligua/mVGGT/notebooks/matching_data/matching_gt.npy",
+        "/scratch/cvlab/home/pilligua/mVGGT/notebooks/matching_data/matching_gt.npy",
+    ]
+    
+    for matching_gt_path in possible_paths:
+        if os.path.exists(matching_gt_path):
+            MATCHING_GT = torch.from_numpy(np.load(matching_gt_path)).bool().to(device)
+            print(f"      ✓ Loaded matching GT from {matching_gt_path}")
+            print(f"        Shape: {MATCHING_GT.shape}")
+            break
+    
+    if MATCHING_GT is None:
+        print(f"      ⚠ Matching GT not found - sparse attention comparison disabled")
+except Exception as e:
+    print(f"      ⚠ Could not load matching GT: {e}")
 
 
 # -------------------------------------------------------------------------
@@ -98,12 +144,174 @@ def run_model(target_dir, model) -> dict:
 
 
 # -------------------------------------------------------------------------
-# 2) Handle uploaded video/images --> produce target_dir + images
+# 1b) Sparse vs Full Attention Comparison
 # -------------------------------------------------------------------------
-def handle_uploads(input_video, input_images):
+def run_model_comparison(target_dir, model, compare_sparse=True) -> tuple:
+    """
+    Run VGGT inference with both full and sparse attention, measuring timing and memory.
+    Returns (full_attn_predictions, sparse_attn_predictions, timing_info).
+    """
+    print(f"\n{'='*80}")
+    print("STARTING FULL VS SPARSE ATTENTION COMPARISON")
+    print(f"{'='*80}\n")
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available():
+        raise ValueError("CUDA is not available. Check your environment.")
+
+    # Move model to device
+    model = model.to(device)
+    model.eval()
+
+    # Load images
+    image_names = glob.glob(os.path.join(target_dir, "images", "*"))
+    image_names = sorted(image_names)
+    if len(image_names) == 0:
+        raise ValueError("No images found. Check your upload.")
+    
+    images = load_and_preprocess_images(image_names).to(device)
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    
+    timing_info = {}
+
+    # ---- FULL ATTENTION ----
+    print("[1/2] Running FULL ATTENTION inference...")
+    print("-" * 80)
+    
+    model.disable_sparse_attention()
+    torch.cuda.empty_cache() if device == "cuda" else None
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    
+    with torch.no_grad():
+        start_time = time.time()
+        with torch.cuda.amp.autocast(dtype=dtype):
+            full_predictions = model(images)
+        full_time = time.time() - start_time
+    
+    full_memory = 0
+    if device == "cuda":
+        full_memory = torch.cuda.max_memory_allocated() / 1e9
+    
+    # Post-process full attention results
+    extrinsic_full, intrinsic_full = pose_encoding_to_extri_intri(full_predictions["pose_enc"], images.shape[-2:])
+    full_predictions["extrinsic"] = extrinsic_full
+    full_predictions["intrinsic"] = intrinsic_full
+    
+    for key in full_predictions.keys():
+        if isinstance(full_predictions[key], torch.Tensor):
+            full_predictions[key] = full_predictions[key].cpu().numpy().squeeze(0)
+    full_predictions['pose_enc_list'] = None
+    
+    depth_map_full = full_predictions["depth"]
+    world_points_full = unproject_depth_map_to_point_map(depth_map_full, full_predictions["extrinsic"], full_predictions["intrinsic"])
+    full_predictions["world_points_from_depth"] = world_points_full
+    
+    print(f"✓ Full Attention - Time: {full_time:.4f}s, Memory: {full_memory:.2f}GB")
+    timing_info['full_time'] = full_time
+    timing_info['full_memory'] = full_memory
+
+    # ---- SPARSE ATTENTION ----
+    sparse_predictions = None
+    sparse_time = 0
+    sparse_memory = 0
+    
+    if compare_sparse and MATCHING_GT is not None:
+        print("\n[2/2] Running SPARSE ATTENTION inference...")
+        print("-" * 80)
+        
+        model.enable_sparse_attention(matching_gt=MATCHING_GT)
+        torch.cuda.empty_cache() if device == "cuda" else None
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        
+        with torch.no_grad():
+            start_time = time.time()
+            with torch.cuda.amp.autocast(dtype=dtype):
+                sparse_predictions = model(images)
+            sparse_time = time.time() - start_time
+        
+        if device == "cuda":
+            sparse_memory = torch.cuda.max_memory_allocated() / 1e9
+        
+        # Post-process sparse attention results
+        extrinsic_sparse, intrinsic_sparse = pose_encoding_to_extri_intri(sparse_predictions["pose_enc"], images.shape[-2:])
+        sparse_predictions["extrinsic"] = extrinsic_sparse
+        sparse_predictions["intrinsic"] = intrinsic_sparse
+        
+        for key in sparse_predictions.keys():
+            if isinstance(sparse_predictions[key], torch.Tensor):
+                sparse_predictions[key] = sparse_predictions[key].cpu().numpy().squeeze(0)
+        sparse_predictions['pose_enc_list'] = None
+        
+        depth_map_sparse = sparse_predictions["depth"]
+        world_points_sparse = unproject_depth_map_to_point_map(depth_map_sparse, sparse_predictions["extrinsic"], sparse_predictions["intrinsic"])
+        sparse_predictions["world_points_from_depth"] = world_points_sparse
+        
+        print(f"✓ Sparse Attention - Time: {sparse_time:.4f}s, Memory: {sparse_memory:.2f}GB")
+        timing_info['sparse_time'] = sparse_time
+        timing_info['sparse_memory'] = sparse_memory
+        
+        # Compute speedup
+        speedup = full_time / sparse_time if sparse_time > 0 else 0
+        memory_reduction = full_memory / sparse_memory if sparse_memory > 0 else 0
+        
+        timing_info['speedup'] = speedup
+        timing_info['memory_reduction'] = memory_reduction
+        
+        print(f"\n📊 PERFORMANCE COMPARISON:")
+        print(f"  {'Attribute':<25} {'Full Attention':<20} {'Sparse Attention':<20}")
+        print(f"  {'-'*65}")
+        print(f"  {'Inference Time (s)':<25} {full_time:<20.4f} {sparse_time:<20.4f}")
+        print(f"  {'Memory (GB)':<25} {full_memory:<20.2f} {sparse_memory:<20.2f}")
+        print(f"  {'Speedup':<25} {'1.0x':<20} {f'{speedup:.2f}x':<20}")
+        print(f"  {'Memory Reduction':<25} {'1.0x':<20} {f'{memory_reduction:.2f}x':<20}")
+        
+    torch.cuda.empty_cache()
+    
+    return full_predictions, sparse_predictions, timing_info
+
+
+def compare_attention_methods(target_dir, model) -> str:
+    """
+    Generate a detailed comparison report between full and sparse attention.
+    """
+    if not os.path.isdir(target_dir):
+        return "❌ No valid target directory found."
+    
+    try:
+        full_preds, sparse_preds, timing = run_model_comparison(target_dir, model, compare_sparse=True)
+        
+        report = "## Attention Comparison Results\n\n"
+        
+        if timing:
+            report += "### Performance Metrics\n\n"
+            report += "| Metric | Full Attention | Sparse Attention |\n"
+            report += "|--------|----------------|------------------|\n"
+            report += f"| Inference Time (s) | {timing.get('full_time', 0):.4f} | {timing.get('sparse_time', 0):.4f} |\n"
+            report += f"| Memory (GB) | {timing.get('full_memory', 0):.2f} | {timing.get('sparse_memory', 0):.2f} |\n"
+            
+            if 'speedup' in timing:
+                report += f"| **Speedup** | - | **{timing['speedup']:.2f}x** |\n"
+            if 'memory_reduction' in timing:
+                report += f"| **Memory Reduction** | - | **{timing['memory_reduction']:.2f}x** |\n"
+        
+        report += "\n✅ Comparison complete! Both reconstructions are now available for visualization."
+        return report
+        
+    except Exception as e:
+        return f"❌ Error during comparison: {str(e)}"
+
+
+# -------------------------------------------------------------------------
+# 2) Handle uploaded images --> produce target_dir + images
+# -------------------------------------------------------------------------
+def handle_uploads(input_images):
     """
     Create a new 'target_dir' + 'images' subfolder, and place user-uploaded
-    images or extracted frames from video into it. Return (target_dir, image_paths).
+    images into it. Return (target_dir, image_paths).
+    Note: Video support requires OpenGL libraries not available in headless containers.
+    Please pre-extract video frames and upload as images instead.
     """
     start_time = time.time()
     gc.collect()
@@ -133,30 +341,6 @@ def handle_uploads(input_video, input_images):
             shutil.copy(file_path, dst_path)
             image_paths.append(dst_path)
 
-    # --- Handle video ---
-    if input_video is not None:
-        if isinstance(input_video, dict) and "name" in input_video:
-            video_path = input_video["name"]
-        else:
-            video_path = input_video
-
-        vs = cv2.VideoCapture(video_path)
-        fps = vs.get(cv2.CAP_PROP_FPS)
-        frame_interval = int(fps * 1)  # 1 frame/sec
-
-        count = 0
-        video_frame_num = 0
-        while True:
-            gotit, frame = vs.read()
-            if not gotit:
-                break
-            count += 1
-            if count % frame_interval == 0:
-                image_path = os.path.join(target_dir_images, f"{video_frame_num:06}.png")
-                cv2.imwrite(image_path, frame)
-                image_paths.append(image_path)
-                video_frame_num += 1
-
     # Sort final images for gallery
     image_paths = sorted(image_paths)
 
@@ -168,15 +352,15 @@ def handle_uploads(input_video, input_images):
 # -------------------------------------------------------------------------
 # 3) Update gallery on upload
 # -------------------------------------------------------------------------
-def update_gallery_on_upload(input_video, input_images):
+def update_gallery_on_upload(input_images):
     """
     Whenever user uploads or changes files, immediately handle them
     and show in the gallery. Return (target_dir, image_paths).
     If nothing is uploaded, returns "None" and empty list.
     """
-    if not input_video and not input_images:
+    if not input_images:
         return None, None, None, None
-    target_dir, image_paths = handle_uploads(input_video, input_images)
+    target_dir, image_paths = handle_uploads(input_images)
     return None, target_dir, image_paths, "Upload complete. Click 'Reconstruct' to begin 3D processing."
 
 
@@ -327,31 +511,78 @@ def update_visualization(
 
 
 # -------------------------------------------------------------------------
-# Example images
+# Pre-extracted scene discovery and loading
 # -------------------------------------------------------------------------
+SCENE_DATA_BASE = "/scratch/cvlab/home/pilligua/mVGGT/notebooks"
 
-great_wall_video = "examples/videos/great_wall.mp4"
-colosseum_video = "examples/videos/Colosseum.mp4"
-room_video = "examples/videos/room.mp4"
-kitchen_video = "examples/videos/kitchen.mp4"
-fern_video = "examples/videos/fern.mp4"
-single_cartoon_video = "examples/videos/single_cartoon.mp4"
-single_oil_painting_video = "examples/videos/single_oil_painting.mp4"
-pyramid_video = "examples/videos/pyramid.mp4"
+def discover_scenes():
+    """Find all matching_data* directories (recursively) with images.npy and matching_gt.npy."""
+    scenes = {}
+    base = Path(SCENE_DATA_BASE)
+    if not base.exists():
+        print(f"      ⚠ Scene data base not found: {SCENE_DATA_BASE}")
+        return scenes
+    for d in sorted(base.rglob("matching_data*")):
+        if not d.is_dir():
+            continue
+        if (d / "images.npy").exists() and (d / "matching_gt.npy").exists():
+            name = d.name
+            if name.startswith("matching_data_"):
+                name = name[len("matching_data_") :]
+            if name == "":
+                name = "original"
+            scenes[name] = str(d)
+    return scenes
+
+AVAILABLE_SCENES = discover_scenes()
+print(f"      ✓ Found {len(AVAILABLE_SCENES)} pre-extracted scenes: {list(AVAILABLE_SCENES.keys())}")
+
+
+def load_scene_from_npy(scene_name):
+    """
+    Load a pre-extracted scene's images from .npy, save them as PNGs
+    in a new target_dir/images folder, and return (target_dir, image_paths, status).
+    """
+    if scene_name is None or scene_name not in AVAILABLE_SCENES:
+        return None, None, "Please select a scene."
+
+    scene_dir = AVAILABLE_SCENES[scene_name]
+    images_npy = np.load(os.path.join(scene_dir, "images.npy"))  # [1, V, 3, H, W]
+    images = images_npy[0]  # [V, 3, H, W]
+
+    # Create target dir
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    target_dir = f"input_images_{timestamp}"
+    target_dir_images = os.path.join(target_dir, "images")
+    os.makedirs(target_dir_images, exist_ok=True)
+
+    image_paths = []
+    for i in range(images.shape[0]):
+        img = images[i].transpose(1, 2, 0)  # [H, W, 3]
+        img = (img * 255).clip(0, 255).astype(np.uint8)
+        from PIL import Image as PILImage
+        path = os.path.join(target_dir_images, f"view_{i:02d}.png")
+        PILImage.fromarray(img).save(path)
+        image_paths.append(path)
+
+    print(f"Loaded scene '{scene_name}': {len(image_paths)} views from {scene_dir}")
+    return target_dir, image_paths, f"Loaded scene **{scene_name}** ({len(image_paths)} views). Click 'Reconstruct' to begin."
+
+
+# Note: Video examples removed - provide pre-extracted image frames instead
 
 
 # -------------------------------------------------------------------------
 # 6) Build Gradio UI
 # -------------------------------------------------------------------------
+print("[4/4] Building Gradio web interface...")
 theme = gr.themes.Ocean()
 theme.set(
     checkbox_label_background_fill_selected="*button_primary_background_fill",
     checkbox_label_text_color_selected="*button_primary_text_color",
 )
 
-with gr.Blocks(
-    theme=theme,
-    css="""
+custom_css = """
     .custom-log * {
         font-style: italic;
         font-size: 22px !important;
@@ -388,8 +619,9 @@ with gr.Blocks(
         padding: 10px 0;
         box-sizing: border-box;
     }
-    """,
-) as demo:
+    """
+
+with gr.Blocks() as demo:
     # Instead of gr.State, we use a hidden Textbox:
     is_example = gr.Textbox(label="is_example", visible=False, value="None")
     num_images = gr.Textbox(label="num_images", visible=False, value="None")
@@ -403,11 +635,11 @@ with gr.Blocks(
     </p>
 
     <div style="font-size: 16px; line-height: 1.5;">
-    <p>Upload a video or a set of images to create a 3D reconstruction of a scene or object. VGGT takes these images and generates a 3D point cloud, along with estimated camera poses.</p>
+    <p>Upload a set of images to create a 3D reconstruction of a scene or object. VGGT takes these images and generates a 3D point cloud, along with estimated camera poses.</p>
 
     <h3>Getting Started:</h3>
     <ol>
-        <li><strong>Upload Your Data:</strong> Use the "Upload Video" or "Upload Images" buttons on the left to provide your input. Videos will be automatically split into individual frames (one frame per second).</li>
+        <li><strong>Upload Your Images:</strong> Use the "Upload Images" button on the left to provide your input. For best results, provide multiple views of the same scene.</li>
         <li><strong>Preview:</strong> Your uploaded images will appear in the gallery on the left.</li>
         <li><strong>Reconstruct:</strong> Click the "Reconstruct" button to start the 3D reconstruction process.</li>
         <li><strong>Visualize:</strong> The 3D reconstruction will appear in the viewer on the right. You can rotate, pan, and zoom to explore the model, and download the GLB file. Note the visualization of 3D points may be slow for a large number of input images.</li>
@@ -435,16 +667,25 @@ with gr.Blocks(
 
     with gr.Row():
         with gr.Column(scale=2):
-            input_video = gr.Video(label="Upload Video", interactive=True)
+            gr.Markdown("### Load a Pre-extracted Scene")
+            scene_choices = list(AVAILABLE_SCENES.keys()) if AVAILABLE_SCENES else []
+            scene_selector = gr.Dropdown(
+                choices=scene_choices,
+                value=scene_choices[0] if scene_choices else None,
+                label="Select Scene",
+                info=f"{len(scene_choices)} scenes available (ScanNet indoor + VKITTI driving)",
+                interactive=True,
+            )
+            load_scene_btn = gr.Button("Load Scene", variant="secondary")
+
+            gr.Markdown("---\n*Or upload your own images:*")
             input_images = gr.File(file_count="multiple", label="Upload Images", interactive=True)
 
             image_gallery = gr.Gallery(
                 label="Preview",
                 columns=4,
                 height="300px",
-                show_download_button=True,
                 object_fit="contain",
-                preview=True,
             )
 
         with gr.Column(scale=4):
@@ -458,7 +699,7 @@ with gr.Blocks(
             with gr.Row():
                 submit_btn = gr.Button("Reconstruct", scale=1, variant="primary")
                 clear_btn = gr.ClearButton(
-                    [input_video, input_images, reconstruction_output, log_output, target_dir_output, image_gallery],
+                    [input_images, reconstruction_output, log_output, target_dir_output, image_gallery],
                     scale=1,
                 )
 
@@ -480,19 +721,65 @@ with gr.Blocks(
                     mask_black_bg = gr.Checkbox(label="Filter Black Background", value=False)
                     mask_white_bg = gr.Checkbox(label="Filter White Background", value=False)
 
+    # ---------------------- Sparse Attention Comparison Section ----------------------
+    gr.Markdown(
+        """
+        ---
+        ## 🚀 Sparse vs Full Attention Comparison
+        Compare 3D reconstructions using full multi-view attention vs optimized sparse attention.
+        This demonstrates the computational efficiency gains from our sparse attention mechanism.
+        """
+    )
+    
+    if MATCHING_GT is not None:
+        with gr.Row():
+            with gr.Column(scale=2):
+                comparison_log = gr.Markdown(
+                    "📝 Click 'Compare Attention Methods' to run both inference modes and compare performance.",
+                    elem_classes=["example-log"]
+                )
+            
+            with gr.Column(scale=1):
+                compare_btn = gr.Button("Compare Attention Methods", variant="secondary", scale=1)
+        
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.Markdown("**Full Attention (Baseline)**")
+                full_attn_output = gr.Model3D(height=450, zoom_speed=0.5, pan_speed=0.5)
+            
+            with gr.Column(scale=2):
+                gr.Markdown("**Sparse Attention (Optimized)**")
+                sparse_attn_output = gr.Model3D(height=450, zoom_speed=0.5, pan_speed=0.5)
+        
+        with gr.Row():
+            comparison_report = gr.Markdown(
+                "Comparison details will appear here after running the comparison.",
+                label="Comparison Report"
+            )
+    else:
+        gr.Markdown(
+            """
+            ⚠️ **Sparse Attention Comparison Unavailable**
+            
+            The sparse attention comparison feature requires matching ground truth data.
+            To enable this feature, ensure `notebooks/matching_data/matching_gt.npy` is available.
+            
+            See `/mnt/cvlab/scratch/cvlab/home/pilligua/claude.md` for more details about the sparse attention implementation.
+            """
+        )
+
     # ---------------------- Examples section ----------------------
     examples = [
-        [colosseum_video, "22", None, 20.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [pyramid_video, "30", None, 35.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [single_cartoon_video, "1", None, 15.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [single_oil_painting_video, "1", None, 20.0, False, False, True, True, "Depthmap and Camera Branch", "True"],
-        [room_video, "8", None, 5.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [kitchen_video, "25", None, 50.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
-        [fern_video, "20", None, 45.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        ["22", None, 20.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        ["30", None, 35.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        ["1", None, 15.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        ["1", None, 20.0, False, False, True, True, "Depthmap and Camera Branch", "True"],
+        ["8", None, 5.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        ["25", None, 50.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
+        ["20", None, 45.0, False, False, True, False, "Depthmap and Camera Branch", "True"],
     ]
 
     def example_pipeline(
-        input_video,
         num_images_str,
         input_images,
         conf_thres,
@@ -509,7 +796,7 @@ with gr.Blocks(
         3) Return model3D + logs + new_dir + updated dropdown + gallery
         We do NOT return is_example. It's just an input.
         """
-        target_dir, image_paths = handle_uploads(input_video, input_images)
+        target_dir, image_paths = handle_uploads(input_images)
         # Always use "All" for frame_filter in examples
         frame_filter = "All"
         glbfile, log_msg, dropdown = gradio_demo(
@@ -522,7 +809,6 @@ with gr.Blocks(
     gr.Examples(
         examples=examples,
         inputs=[
-            input_video,
             num_images,
             input_images,
             conf_thres,
@@ -675,17 +961,133 @@ with gr.Blocks(
     )
 
     # -------------------------------------------------------------------------
-    # Auto-update gallery whenever user uploads or changes their files
+    # Sparse Attention Comparison Button Logic
     # -------------------------------------------------------------------------
-    input_video.change(
-        fn=update_gallery_on_upload,
-        inputs=[input_video, input_images],
-        outputs=[reconstruction_output, target_dir_output, image_gallery, log_output],
-    )
-    input_images.change(
-        fn=update_gallery_on_upload,
-        inputs=[input_video, input_images],
+    if MATCHING_GT is not None:
+        def run_comparison_and_generate_models(target_dir):
+            """
+            Run full vs sparse attention comparison and generate GLB files for both.
+            """
+            if not target_dir or target_dir == "None" or not os.path.isdir(target_dir):
+                return None, None, "❌ No valid target directory. Please reconstruct first."
+            
+            try:
+                print("\n" + "="*80)
+                print("GENERATING FULL VS SPARSE ATTENTION COMPARISON")
+                print("="*80)
+                
+                # Run comparison
+                full_preds, sparse_preds, timing = run_model_comparison(target_dir, model, compare_sparse=True)
+                
+                # Generate GLB file for full attention
+                print("\n[1/2] Generating GLB for full attention...")
+                glbfile_full = os.path.join(target_dir, "glbscene_full_attention.glb")
+                glbscene_full = predictions_to_glb(
+                    full_preds,
+                    conf_thres=50.0,
+                    filter_by_frames="All",
+                    mask_black_bg=False,
+                    mask_white_bg=False,
+                    show_cam=True,
+                    mask_sky=False,
+                    target_dir=target_dir,
+                    prediction_mode="Depthmap and Camera Branch",
+                )
+                glbscene_full.export(file_obj=glbfile_full)
+                print(f"✓ Full attention GLB saved: {glbfile_full}")
+                
+                # Generate GLB file for sparse attention
+                glbfile_sparse = None
+                if sparse_preds is not None:
+                    print("\n[2/2] Generating GLB for sparse attention...")
+                    glbfile_sparse = os.path.join(target_dir, "glbscene_sparse_attention.glb")
+                    glbscene_sparse = predictions_to_glb(
+                        sparse_preds,
+                        conf_thres=50.0,
+                        filter_by_frames="All",
+                        mask_black_bg=False,
+                        mask_white_bg=False,
+                        show_cam=True,
+                        mask_sky=False,
+                        target_dir=target_dir,
+                        prediction_mode="Depthmap and Camera Branch",
+                    )
+                    glbscene_sparse.export(file_obj=glbfile_sparse)
+                    print(f"✓ Sparse attention GLB saved: {glbfile_sparse}")
+                
+                # Generate report
+                report = "## ⚡ Sparse vs Full Attention Comparison\n\n"
+                
+                if timing:
+                    report += "### Performance Metrics\n\n"
+                    report += "| Metric | Full Attention | Sparse Attention |\n"
+                    report += "|--------|----------------|------------------|\n"
+                    report += f"| Inference Time (s) | {timing.get('full_time', 0):.4f} | {timing.get('sparse_time', 0):.4f} |\n"
+                    report += f"| Memory (GB) | {timing.get('full_memory', 0):.2f} | {timing.get('sparse_memory', 0):.2f} |\n"
+                    
+                    if 'speedup' in timing:
+                        report += f"| **Speedup** | - | **{timing['speedup']:.2f}x** |\n"
+                    if 'memory_reduction' in timing:
+                        report += f"| **Memory Reduction** | - | **{timing['memory_reduction']:.2f}x** |\n"
+                
+                report += "\n✅ Both reconstructions generated successfully!\n"
+                report += "Compare the 3D models on the left (Full Attention) and right (Sparse Attention)."
+                
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                return glbfile_full, glbfile_sparse, report
+                
+            except Exception as e:
+                import traceback
+                error_msg = f"❌ Error: {str(e)}\n\n{traceback.format_exc()}"
+                return None, None, error_msg
+        
+        # Only add the button callback if MATCHING_GT is available
+        try:
+            compare_btn.click(
+                fn=run_comparison_and_generate_models,
+                inputs=[target_dir_output],
+                outputs=[full_attn_output, sparse_attn_output, comparison_report],
+            )
+        except NameError:
+            print("⚠ Sparse attention comparison UI not available")
+
+    # -------------------------------------------------------------------------
+    # Load pre-extracted scene from dropdown
+    # -------------------------------------------------------------------------
+    def on_load_scene(scene_name):
+        """Load a pre-extracted scene and populate gallery + target_dir."""
+        if not scene_name:
+            return None, None, None, "Please select a scene from the dropdown."
+        target_dir, image_paths, status = load_scene_from_npy(scene_name)
+        if target_dir is None:
+            return None, None, None, status
+        return None, target_dir, image_paths, status
+
+    load_scene_btn.click(
+        fn=on_load_scene,
+        inputs=[scene_selector],
         outputs=[reconstruction_output, target_dir_output, image_gallery, log_output],
     )
 
-    demo.queue(max_size=20).launch(show_error=True, share=True)
+    # -------------------------------------------------------------------------
+    # Auto-update gallery whenever user uploads or changes their files
+    # -------------------------------------------------------------------------
+    input_images.change(
+        fn=update_gallery_on_upload,
+        inputs=[input_images],
+        outputs=[reconstruction_output, target_dir_output, image_gallery, log_output],
+    )
+
+    # Launch with share=True to get a public URL
+    print("      ✓ UI built successfully")
+    print("\n" + "="*60)
+    print("Starting Gradio server...")
+    print("="*60)
+    demo.queue(max_size=20).launch(
+        theme=theme,
+        css=custom_css,
+        show_error=True, 
+        share=True
+    )
